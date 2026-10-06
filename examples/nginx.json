@@ -1,0 +1,10 @@
+{
+    "kind": "Pod",
+    "name": "nginx",
+    "containers": [
+        {
+            "name": "web",
+            "image": "nginx:1.27"
+        }
+    ]
+}

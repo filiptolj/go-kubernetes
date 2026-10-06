@@ -1,0 +1,443 @@
+// Package kubelet is the agent that runs on every node. It runs the pods the
+// scheduler bound to its node, and reports how they are doing.
+package kubelet
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/filiptolj/go-kubernetes/pkg/api"
+	"github.com/filiptolj/go-kubernetes/pkg/client"
+	"github.com/filiptolj/go-kubernetes/pkg/cri"
+)
+
+// Config describes the node a kubelet manages.
+type Config struct {
+	NodeName  string
+	CPU       int
+	Memory    int
+	LogDir    string        // container logs go to LogDir/<namespace>/<pod>/<container>.log
+	Heartbeat time.Duration // how often to tell the API server the node is alive
+
+	// ListenAddr is where to serve container logs over HTTP, such as ":10250".
+	// Empty means don't serve them.
+	ListenAddr string
+
+	// GracePeriod is how long a deleted pod keeps running before it is
+	// stopped. It gives the proxy time to stop sending it new connections,
+	// and lets requests already in progress finish.
+	GracePeriod time.Duration
+}
+
+// Kubelet runs the pods bound to one node.
+type Kubelet struct {
+	cfg     Config
+	client  *client.Client
+	runtime cri.Runtime
+	events  *client.Recorder
+	address string // where this kubelet serves logs, e.g. "http://localhost:10250"
+
+	mu   sync.Mutex
+	pods map[string]*runningPod // pods this kubelet has started, by "namespace/name"
+}
+
+// runningPod is a pod this kubelet has started.
+type runningPod struct {
+	pod      api.Pod
+	stopping bool // true once the kubelet decided to stop it on purpose
+}
+
+// New returns a Kubelet that talks to the API server through c and runs
+// containers with rt.
+func New(cfg Config, c *client.Client, rt cri.Runtime) *Kubelet {
+	return &Kubelet{
+		cfg:     cfg,
+		client:  c,
+		runtime: rt,
+		events:  c.Recorder("kubelet on " + cfg.NodeName),
+		pods:    make(map[string]*runningPod),
+	}
+}
+
+// Run registers the node, then runs the pods bound to it until ctx is
+// cancelled. If the API server goes away, the pods keep running and the
+// kubelet reconnects. On the way out it stops its pods and marks the node
+// NotReady.
+func (k *Kubelet) Run(ctx context.Context) error {
+	// Containers left over from an earlier run have nobody watching them.
+	// Start from a clean slate.
+	err := k.runtime.RemoveAll()
+	if err != nil {
+		log.Printf("could not remove old containers: %v", err)
+	}
+
+	if k.cfg.ListenAddr != "" {
+		l, err := net.Listen("tcp", k.cfg.ListenAddr)
+		if err != nil {
+			return fmt.Errorf("serve logs: %w", err)
+		}
+		k.address = fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port)
+
+		srv := &http.Server{Handler: k.logsHandler()}
+		go srv.Serve(l)
+		defer srv.Close()
+		log.Printf("serving container logs on %s", k.address)
+	}
+
+	err = client.Retry(ctx, "register node", func() error {
+		return k.heartbeat(true)
+	})
+	if err != nil {
+		return nil // cancelled before the API server was ever reachable
+	}
+	log.Printf("registered node %q", k.cfg.NodeName)
+	k.events.Normal("Node", "", k.cfg.NodeName, "KubeletStarted", "kubelet started")
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		k.heartbeatLoop(ctx)
+	}()
+
+	client.Retry(ctx, "watch pods", func() error {
+		return k.sync(ctx)
+	})
+
+	cancel()
+	<-heartbeatDone
+	k.shutdown()
+	return nil
+}
+
+// sync lists the pods, then watches them, starting and stopping pods on this
+// node as needed. It returns when the watch ends.
+func (k *Kubelet) sync(ctx context.Context) error {
+	// Start watching before listing, so no pod can slip through the gap between them.
+	events, err := k.client.WatchPods(ctx)
+	if err != nil {
+		return err
+	}
+
+	pods, err := k.client.ListPods("") // every namespace
+	if err != nil {
+		return err
+	}
+	for _, pod := range pods {
+		k.recover(pod)
+		k.handle(pod)
+	}
+
+	for event := range events {
+		if event.Type == api.EventDeleted {
+			k.stopPodLater(api.Key(event.Pod.Namespace, event.Pod.Name))
+			continue
+		}
+		k.handle(event.Pod)
+	}
+	return errors.New("lost connection to the API server")
+}
+
+// recover fails pods that are marked Running on this node but that this
+// kubelet isn't running: they were started by an earlier kubelet that has
+// since died, and their containers were removed when this one started. If
+// such a pod belongs to a ReplicaSet, the ReplicaSet controller replaces it.
+func (k *Kubelet) recover(pod api.Pod) {
+	if pod.NodeName != k.cfg.NodeName || pod.Phase != api.PodRunning {
+		return
+	}
+
+	key := api.Key(pod.Namespace, pod.Name)
+	k.mu.Lock()
+	_, ours := k.pods[key]
+	k.mu.Unlock()
+	if ours {
+		return
+	}
+
+	log.Printf("pod %s was left running by an earlier kubelet: failing it", key)
+	k.events.Warning("Pod", pod.Namespace, pod.Name, "Lost", "the kubelet on %s restarted while this pod ran; its containers are gone", k.cfg.NodeName)
+	k.report(pod, api.PodFailed)
+}
+
+// handle starts a pod if it is bound to this node and still waiting to run.
+func (k *Kubelet) handle(pod api.Pod) {
+	if pod.NodeName != k.cfg.NodeName || pod.Phase != api.PodPending {
+		return
+	}
+
+	key := api.Key(pod.Namespace, pod.Name)
+	k.mu.Lock()
+	_, started := k.pods[key]
+	if !started {
+		k.pods[key] = &runningPod{pod: pod}
+	}
+	k.mu.Unlock()
+
+	if !started {
+		k.startPod(pod)
+	}
+}
+
+// startPod starts all of a pod's containers, reports it Running, and then
+// watches it in the background until it finishes.
+func (k *Kubelet) startPod(pod api.Pod) {
+	key := api.Key(pod.Namespace, pod.Name)
+	log.Printf("starting pod %s", key)
+
+	results, address, logs, err := k.startContainers(pod)
+	if err != nil {
+		log.Printf("pod %s failed to start: %v", key, err)
+		k.events.Warning("Pod", pod.Namespace, pod.Name, "FailedStart", "%v", err)
+		k.forget(key)
+		k.report(pod, api.PodFailed)
+		return
+	}
+
+	for _, c := range pod.Containers {
+		k.events.Normal("Pod", pod.Namespace, pod.Name, "Started", "started container %q from image %q", c.Name, c.Image)
+	}
+
+	// A pod without a port has nothing to check: it is ready as soon as it
+	// runs. A pod with a port is ready once something answers on it.
+	ready := address == ""
+	err = k.client.SetPodStatus(pod.Namespace, pod.Name, api.PodStatus{Phase: api.PodRunning, Ready: ready, Address: address})
+	if err != nil {
+		log.Printf("could not report pod %s as Running: %v", key, err)
+	}
+	go k.waitForPod(pod, results, logs)
+	if !ready {
+		go k.waitUntilReady(pod, address)
+	}
+}
+
+// logDir returns the folder for a pod's container logs: LogDir/namespace/pod.
+func (k *Kubelet) logDir(namespace, pod string) string {
+	return filepath.Join(k.cfg.LogDir, namespace, pod)
+}
+
+// startContainers starts every container of the pod, each writing to its own
+// log file. It returns the pod's address: that of the first container with a
+// port. If one container fails to start, the ones already started are
+// stopped again.
+func (k *Kubelet) startContainers(pod api.Pod) ([]<-chan error, string, []*os.File, error) {
+	dir := k.logDir(pod.Namespace, pod.Name)
+	err := os.MkdirAll(dir, 0o755)
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	var results []<-chan error
+	var address string
+	var logs []*os.File
+	for _, c := range pod.Containers {
+		running, f, err := k.startContainer(dir, pod, c)
+		if err != nil {
+			k.stopContainers(pod)
+			for _, f := range logs {
+				f.Close()
+			}
+			return nil, "", nil, err
+		}
+		results = append(results, running.Done)
+		logs = append(logs, f)
+		if address == "" {
+			address = running.Address
+		}
+	}
+	return results, address, logs, nil
+}
+
+// startContainer opens the container's log file and starts the container.
+func (k *Kubelet) startContainer(dir string, pod api.Pod, c api.Container) (cri.Running, *os.File, error) {
+	f, err := os.Create(filepath.Join(dir, c.Name+".log"))
+	if err != nil {
+		return cri.Running{}, nil, err
+	}
+
+	running, err := k.runtime.Start(pod, c, f)
+	if err != nil {
+		f.Close()
+		return cri.Running{}, nil, err
+	}
+	return running, f, nil
+}
+
+// waitForPod waits until all of the pod's containers have exited, then
+// reports Succeeded if they all exited cleanly, or Failed otherwise.
+func (k *Kubelet) waitForPod(pod api.Pod, results []<-chan error, logs []*os.File) {
+	key := api.Key(pod.Namespace, pod.Name)
+
+	phase := api.PodSucceeded
+	for i, done := range results {
+		err := <-done
+		if err != nil {
+			log.Printf("pod %s: container %q exited: %v", key, pod.Containers[i].Name, err)
+			if !k.isStopping(key) {
+				k.events.Warning("Pod", pod.Namespace, pod.Name, "Failed", "container %q exited: %v", pod.Containers[i].Name, err)
+			}
+			phase = api.PodFailed
+		}
+		logs[i].Close()
+	}
+
+	k.mu.Lock()
+	rp := k.pods[key]
+	stopping := rp != nil && rp.stopping
+	delete(k.pods, key)
+	k.mu.Unlock()
+
+	// If the kubelet stopped the pod on purpose, the containers were killed and
+	// their exit codes mean nothing. Whoever stopped the pod reports instead.
+	if stopping {
+		return
+	}
+
+	log.Printf("pod %s finished: %s", key, phase)
+	if phase == api.PodSucceeded {
+		k.events.Normal("Pod", pod.Namespace, pod.Name, "Completed", "all containers exited successfully")
+	}
+	k.report(pod, phase)
+}
+
+// stopPodLater stops a deleted pod once the grace period is over. key is the
+// pod's "namespace/name".
+func (k *Kubelet) stopPodLater(key string) {
+	if k.cfg.GracePeriod == 0 {
+		k.stopPod(key)
+		return
+	}
+
+	// time.AfterFunc runs the function in its own goroutine once the time is
+	// up. Meanwhile the kubelet carries on handling other pods.
+	time.AfterFunc(k.cfg.GracePeriod, func() {
+		k.stopPod(key)
+	})
+}
+
+// stopPod stops a pod this kubelet is running, by its "namespace/name". It
+// returns false if the pod isn't running here.
+func (k *Kubelet) stopPod(key string) bool {
+	k.mu.Lock()
+	rp, ok := k.pods[key]
+	if ok {
+		rp.stopping = true
+	}
+	k.mu.Unlock()
+
+	if !ok {
+		return false
+	}
+
+	log.Printf("stopping pod %s", key)
+	k.events.Normal("Pod", rp.pod.Namespace, rp.pod.Name, "Killing", "stopping the pod's containers")
+	k.stopContainers(rp.pod)
+	return true
+}
+
+// stopContainers stops every container of the pod.
+func (k *Kubelet) stopContainers(pod api.Pod) {
+	for _, c := range pod.Containers {
+		err := k.runtime.Stop(pod, c)
+		if err != nil {
+			log.Printf("pod %s: %v", api.Key(pod.Namespace, pod.Name), err)
+		}
+	}
+}
+
+// shutdown stops every pod this kubelet runs, reports them Failed because
+// their node is going away, and marks the node NotReady.
+func (k *Kubelet) shutdown() {
+	k.mu.Lock()
+	var running []api.Pod
+	for _, rp := range k.pods {
+		running = append(running, rp.pod)
+	}
+	k.mu.Unlock()
+
+	for _, pod := range running {
+		if k.stopPod(api.Key(pod.Namespace, pod.Name)) {
+			k.report(pod, api.PodFailed)
+		}
+	}
+
+	err := k.heartbeat(false)
+	if err != nil {
+		log.Printf("could not mark node %q NotReady: %v", k.cfg.NodeName, err)
+		return
+	}
+	log.Printf("marked node %q NotReady", k.cfg.NodeName)
+	k.events.Normal("Node", "", k.cfg.NodeName, "KubeletStopped", "kubelet shut down, node marked NotReady")
+}
+
+// isRunning reports whether this kubelet is running a pod, by its "namespace/name".
+func (k *Kubelet) isRunning(key string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	_, ok := k.pods[key]
+	return ok
+}
+
+// isStopping reports whether this kubelet is stopping a pod on purpose.
+func (k *Kubelet) isStopping(key string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	rp, ok := k.pods[key]
+	return ok && rp.stopping
+}
+
+// forget removes a pod from the kubelet's list of running pods.
+func (k *Kubelet) forget(key string) {
+	k.mu.Lock()
+	delete(k.pods, key)
+	k.mu.Unlock()
+}
+
+// report tells the API server a pod's new phase.
+func (k *Kubelet) report(pod api.Pod, phase api.PodPhase) {
+	err := k.client.SetPodPhase(pod.Namespace, pod.Name, phase)
+	if err != nil {
+		log.Printf("could not report pod %s as %s: %v", api.Key(pod.Namespace, pod.Name), phase, err)
+	}
+}
+
+// heartbeat registers the node with the API server, or refreshes it.
+func (k *Kubelet) heartbeat(ready bool) error {
+	return k.client.PutNode(api.Node{
+		Name:    k.cfg.NodeName,
+		CPU:     k.cfg.CPU,
+		Memory:  k.cfg.Memory,
+		Ready:   ready,
+		Address: k.address,
+	})
+}
+
+// heartbeatLoop sends a heartbeat every cfg.Heartbeat until ctx is cancelled.
+func (k *Kubelet) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(k.cfg.Heartbeat)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := k.heartbeat(true)
+			if err != nil {
+				log.Printf("heartbeat failed: %v", err)
+			}
+		}
+	}
+}

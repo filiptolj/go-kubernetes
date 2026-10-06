@@ -1,0 +1,11 @@
+{
+  "kind": "Pod",
+  "name": "crash",
+  "containers": [
+    {
+      "name": "main",
+      "image": "busybox:1.36",
+      "command": ["sh", "-c", "echo about to crash; sleep 5; exit 1"]
+    }
+  ]
+}

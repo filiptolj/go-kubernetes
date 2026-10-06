@@ -1,0 +1,10 @@
+{
+    "kind": "Pod",
+    "name": "redis",
+    "containers": [
+        {
+            "name": "db",
+            "image": "redis:7"
+        }
+    ]
+}

@@ -1,0 +1,13 @@
+# Programs built with `go build -o bin/ ./cmd/...`
+bin/
+
+# The cluster state the API server saves by default
+data/
+
+# Temporary files the file backend writes before renaming them
+*.tmp
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
