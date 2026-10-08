@@ -13,11 +13,14 @@ import (
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 )
 
-// logsHandler serves container logs: GET /logs/{namespace}/{pod}/{container},
-// with ?follow=true to keep sending new output as it is written.
-func (k *Kubelet) logsHandler() http.Handler {
+// handler serves the kubelet's own small API:
+//
+//	GET  /logs/{namespace}/{pod}/{container}  a container's logs; ?follow=true keeps sending new output
+//	POST /exec/{namespace}/{pod}/{container}  run a command in a container; see handleExec
+func (k *Kubelet) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs/{namespace}/{pod}/{container}", k.handleLogs)
+	mux.HandleFunc("POST /exec/{namespace}/{pod}/{container}", k.handleExec)
 	return mux
 }
 

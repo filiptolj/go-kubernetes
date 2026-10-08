@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+spec:
+  restartPolicy: Never
+  containers:
+  - name: main
+    image: busybox:1.36
+    command: ["sh", "-c", "echo hello; for i in 1 2 3; do echo tick $i; sleep 5; done; echo bye"]

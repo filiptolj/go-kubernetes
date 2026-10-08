@@ -1,7 +1,6 @@
 package store
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -48,8 +47,11 @@ type Store struct {
 
 	events      []api.Event
 	nextEventID int
-	watchers    map[int]chan api.PodEvent
+	watchers    map[int]*watcher
 	nextID      int
+
+	// version is the last resourceVersion handed out. See meta.go.
+	version uint64
 }
 
 // New returns a Store that keeps everything in memory only. It starts with
@@ -62,47 +64,47 @@ func New() *Store {
 		deployments: make(map[string]api.Deployment),
 		services:    make(map[string]api.Service),
 		namespaces: map[string]api.Namespace{
-			api.DefaultNamespace: {Name: api.DefaultNamespace},
+			api.DefaultNamespace: {
+				TypeMeta:   api.TypeMetaFor("Namespace"),
+				ObjectMeta: api.ObjectMeta{Name: api.DefaultNamespace},
+			},
 		},
-		watchers: make(map[int]chan api.PodEvent),
+		watchers: make(map[int]*watcher),
 	}
 
-	s.Jobs = newResource(s, "jobs", "job", func(j *api.Job) *api.Meta { return &j.Meta })
-	s.CronJobs = newResource(s, "cronJobs", "cronjob", func(c *api.CronJob) *api.Meta { return &c.Meta })
-	s.DaemonSets = newResource(s, "daemonSets", "daemonset", func(d *api.DaemonSet) *api.Meta { return &d.Meta })
-	s.StatefulSets = newResource(s, "statefulSets", "statefulset", func(ss *api.StatefulSet) *api.Meta { return &ss.Meta })
-	s.ConfigMaps = newResource(s, "configMaps", "configmap", func(c *api.ConfigMap) *api.Meta { return &c.Meta })
-	s.Secrets = newResource(s, "secrets", "secret", func(sec *api.Secret) *api.Meta { return &sec.Meta })
+	s.Jobs = newResource[api.Job](s, "jobs", "job")
+	s.CronJobs = newResource[api.CronJob](s, "cronJobs", "cronjob")
+	s.DaemonSets = newResource[api.DaemonSet](s, "daemonSets", "daemonset")
+	s.StatefulSets = newResource[api.StatefulSet](s, "statefulSets", "statefulset")
+	s.ConfigMaps = newResource[api.ConfigMap](s, "configMaps", "configmap")
+	s.Secrets = newResource[api.Secret](s, "secrets", "secret")
 	return s
 }
 
 // CreatePod saves a new pod. It fails if a pod with that name already exists.
-func (s *Store) CreatePod(pod api.Pod) error {
+func (s *Store) CreatePod(pod api.Pod) (api.Pod, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	err := s.checkNamespace(pod.Namespace)
 	if err != nil {
-		return err
+		return api.Pod{}, err
 	}
 
 	key := api.Key(pod.Namespace, pod.Name)
 	_, exists := s.pods[key]
 	if exists {
-		return fmt.Errorf("pod %q already exists in namespace %q: %w", pod.Name, pod.Namespace, ErrConflict)
+		return api.Pod{}, fmt.Errorf("pod %q already exists in namespace %q: %w", pod.Name, pod.Namespace, ErrConflict)
 	}
 
-	// rand.Text returns a random string: 26 letters and digits, too many
-	// combinations for two pods to ever get the same one.
-	pod.UID = rand.Text()
+	s.stampNew(&pod.ObjectMeta)
 
-	err = s.put(kindPods, key, pod)
+	err = s.put(api.EventAdded, kindPods, key, pod)
 	if err != nil {
-		return err
+		return api.Pod{}, err
 	}
 	s.pods[key] = pod
-	s.notify(api.PodEvent{Type: api.EventAdded, Pod: pod})
-	return nil
+	return pod, nil
 }
 
 // ListPods returns the pods in a namespace, or in all namespaces if
@@ -123,61 +125,23 @@ func (s *Store) GetPod(namespace, name string) (api.Pod, bool) {
 	return pod, ok
 }
 
-// WatchPods returns a channel that receives an event every time a pod changes,
-// and a stop function to call when you no longer want events.
-func (s *Store) WatchPods() (<-chan api.PodEvent, func()) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	id := s.nextID
-	s.nextID++
-
-	ch := make(chan api.PodEvent, 100)
-	s.watchers[id] = ch
-
-	stop := func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		_, ok := s.watchers[id]
-		if ok {
-			delete(s.watchers, id)
-			close(ch)
-		}
-	}
-	return ch, stop
-}
-
-// notify sends an event to every watcher. The caller must hold s.mu.
-func (s *Store) notify(event api.PodEvent) {
-	for id, ch := range s.watchers {
-		select {
-		case ch <- event:
-		default:
-			// This watcher's buffer is full: it is too slow. Drop it so it
-			// can't hold up everyone else. Its channel closes, so it knows.
-			delete(s.watchers, id)
-			close(ch)
-		}
-	}
-}
-
 // CreateNode saves a new node. It fails if a node with that name already exists.
-func (s *Store) CreateNode(node api.Node) error {
+func (s *Store) CreateNode(node api.Node) (api.Node, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	_, exists := s.nodes[node.Name]
 	if exists {
-		return fmt.Errorf("node %q already exists: %w", node.Name, ErrConflict)
+		return api.Node{}, fmt.Errorf("node %q already exists: %w", node.Name, ErrConflict)
 	}
 
-	err := s.put(kindNodes, node.Name, node)
+	s.stampNew(&node.ObjectMeta)
+	err := s.put(api.EventAdded, kindNodes, node.Name, node)
 	if err != nil {
-		return err
+		return api.Node{}, err
 	}
 	s.nodes[node.Name] = node
-	return nil
+	return node, nil
 }
 
 // ListNodes returns every node, sorted by name.
@@ -210,12 +174,12 @@ func (s *Store) BindPod(namespace, podName, nodeName string) (api.Pod, error) {
 	}
 
 	pod.NodeName = nodeName
-	err := s.put(kindPods, key, pod)
+	pod.ResourceVersion = s.nextVersion()
+	err := s.put(api.EventModified, kindPods, key, pod)
 	if err != nil {
 		return api.Pod{}, err
 	}
 	s.pods[key] = pod
-	s.notify(api.PodEvent{Type: api.EventModified, Pod: pod})
 	return pod, nil
 }
 
@@ -232,10 +196,11 @@ func (s *Store) SetPodStatus(namespace, name string, status api.PodStatus) (api.
 		return api.Pod{}, fmt.Errorf("pod %q in namespace %q: %w", name, namespace, ErrNotFound)
 	}
 
-	// A finished pod stays finished. This stops a late "Running" report from
-	// bringing a pod back after it has already been reported Failed.
+	// A finished pod stays finished, the way it finished. This stops a late
+	// report from bringing a pod back after it was reported Failed, or from
+	// turning a success into a failure.
 	finished := pod.Phase == api.PodSucceeded || pod.Phase == api.PodFailed
-	if finished && (status.Phase == api.PodPending || status.Phase == api.PodRunning) {
+	if finished && status.Phase != pod.Phase {
 		return api.Pod{}, fmt.Errorf("pod %q has already finished (%s): %w", name, pod.Phase, ErrConflict)
 	}
 
@@ -258,13 +223,16 @@ func (s *Store) SetPodStatus(namespace, name string, status api.PodStatus) (api.
 	if status.Address != "" {
 		pod.Address = status.Address
 	}
+	if status.HostPorts != nil {
+		pod.HostPorts = status.HostPorts
+	}
+	pod.ResourceVersion = s.nextVersion()
 
-	err := s.put(kindPods, key, pod)
+	err := s.put(api.EventModified, kindPods, key, pod)
 	if err != nil {
 		return api.Pod{}, err
 	}
 	s.pods[key] = pod
-	s.notify(api.PodEvent{Type: api.EventModified, Pod: pod})
 	return pod, nil
 }
 
@@ -275,7 +243,17 @@ func (s *Store) PutNode(node api.Node) (api.Node, error) {
 	defer s.mu.Unlock()
 
 	node.LastHeartbeat = time.Now()
-	err := s.put(kindNodes, node.Name, node)
+	event := api.EventModified
+	if old, ok := s.nodes[node.Name]; ok {
+		err := s.stampUpdate(&node.ObjectMeta, old.ObjectMeta)
+		if err != nil {
+			return api.Node{}, err
+		}
+	} else {
+		s.stampNew(&node.ObjectMeta)
+		event = api.EventAdded
+	}
+	err := s.put(event, kindNodes, node.Name, node)
 	if err != nil {
 		return api.Node{}, err
 	}
@@ -303,12 +281,11 @@ func (s *Store) DeletePod(namespace, name string) (api.Pod, error) {
 
 // deletePod removes a pod and tells watchers. The caller must hold s.mu.
 func (s *Store) deletePod(key string, pod api.Pod) error {
-	err := s.remove(kindPods, key)
+	err := s.remove(kindPods, key, pod)
 	if err != nil {
 		return err
 	}
 	delete(s.pods, key)
-	s.notify(api.PodEvent{Type: api.EventDeleted, Pod: pod})
 	return nil
 }
 
@@ -324,7 +301,8 @@ func (s *Store) SetNodeReady(name string, ready bool) (api.Node, error) {
 	}
 
 	node.Ready = ready
-	err := s.put(kindNodes, node.Name, node)
+	node.ResourceVersion = s.nextVersion()
+	err := s.put(api.EventModified, kindNodes, node.Name, node)
 	if err != nil {
 		return api.Node{}, err
 	}
@@ -334,27 +312,28 @@ func (s *Store) SetNodeReady(name string, ready bool) (api.Node, error) {
 
 // CreateReplicaSet saves a new ReplicaSet. It fails if one with that name
 // already exists.
-func (s *Store) CreateReplicaSet(rs api.ReplicaSet) error {
+func (s *Store) CreateReplicaSet(rs api.ReplicaSet) (api.ReplicaSet, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	err := s.checkNamespace(rs.Namespace)
 	if err != nil {
-		return err
+		return api.ReplicaSet{}, err
 	}
 
 	key := api.Key(rs.Namespace, rs.Name)
 	_, exists := s.replicaSets[key]
 	if exists {
-		return fmt.Errorf("replicaset %q already exists in namespace %q: %w", rs.Name, rs.Namespace, ErrConflict)
+		return api.ReplicaSet{}, fmt.Errorf("replicaset %q already exists in namespace %q: %w", rs.Name, rs.Namespace, ErrConflict)
 	}
 
-	err = s.put(kindReplicaSets, key, rs)
+	s.stampNew(&rs.ObjectMeta)
+	err = s.put(api.EventAdded, kindReplicaSets, key, rs)
 	if err != nil {
-		return err
+		return api.ReplicaSet{}, err
 	}
 	s.replicaSets[key] = rs
-	return nil
+	return rs, nil
 }
 
 // ListReplicaSets returns the ReplicaSets in a namespace, or in all
@@ -378,7 +357,7 @@ func (s *Store) DeleteReplicaSet(namespace, name string) error {
 		return fmt.Errorf("replicaset %q in namespace %q: %w", name, namespace, ErrNotFound)
 	}
 
-	err := s.remove(kindReplicaSets, key)
+	err := s.remove(kindReplicaSets, key, s.replicaSets[key])
 	if err != nil {
 		return err
 	}
@@ -398,7 +377,8 @@ func (s *Store) ScaleReplicaSet(namespace, name string, replicas int) (api.Repli
 	}
 
 	rs.Replicas = replicas
-	err := s.put(kindReplicaSets, key, rs)
+	rs.ResourceVersion = s.nextVersion()
+	err := s.put(api.EventModified, kindReplicaSets, key, rs)
 	if err != nil {
 		return api.ReplicaSet{}, err
 	}

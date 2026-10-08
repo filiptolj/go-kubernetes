@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -21,14 +20,16 @@ import (
 // so on up to BackoffMax. A pod that ran for at least HealthyAfter before
 // failing resets the count. This is a crash-loop backoff.
 type ReplicaSetController struct {
-	Client *client.Client
-	Resync time.Duration // how often to check even if nothing seems to change
+	Client    *client.Client
+	Informers *Informers    // where to read pods and ReplicaSets; nil: from Client
+	Resync    time.Duration // how often to check even if nothing seems to change
 
 	BackoffBase  time.Duration
 	BackoffMax   time.Duration
 	HealthyAfter time.Duration
 
-	backoff map[string]*backoff // by the ReplicaSet's "namespace/name"
+	backoff  map[string]*backoff // by the ReplicaSet's "namespace/name"
+	expected expectations        // pods created or deleted but not seen yet
 }
 
 // backoff tracks how a ReplicaSet's pods have been failing.
@@ -38,51 +39,24 @@ type backoff struct {
 	logged   bool      // whether we already said we're waiting
 }
 
-// Run reconciles every ReplicaSet whenever a pod changes, and also every
-// Resync interval in case something was missed, until ctx is cancelled. If
-// the connection to the API server breaks, it reconnects.
+// Run reconciles every ReplicaSet whenever a pod or a ReplicaSet changes,
+// and also every Resync interval, until ctx is cancelled.
 func (rc *ReplicaSetController) Run(ctx context.Context) {
-	client.Retry(ctx, "replicaset controller", func() error {
-		return rc.watch(ctx)
-	})
-}
-
-// watch is Run's main loop. It returns when the watch ends.
-func (rc *ReplicaSetController) watch(ctx context.Context) error {
-	events, err := rc.Client.WatchPods(ctx)
-	if err != nil {
-		return err
-	}
-
-	ticker := time.NewTicker(rc.Resync)
-	defer ticker.Stop()
-
-	rc.reconcileAll()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case _, ok := <-events:
-			if !ok {
-				return errors.New("lost connection to the API server")
-			}
-			rc.reconcileAll()
-		case <-ticker.C:
-			rc.reconcileAll()
-		}
-	}
+	client.RunOnChange(ctx, "replicaset controller", rc.Resync, rc.reconcileAll,
+		rc.Informers.pods(), rc.Informers.replicaSets())
 }
 
 // reconcileAll compares every ReplicaSet with its pods and fixes any
 // difference. It also removes pods whose ReplicaSet no longer exists.
 func (rc *ReplicaSetController) reconcileAll() {
-	sets, err := rc.Client.ListReplicaSets("") // every namespace
+	rc.expected.check() // before reading: see expectations.go
+	sets, err := list(rc.Informers.replicaSets(), rc.Client.ListReplicaSets)
 	if err != nil {
 		log.Printf("replicaset controller: %v", err)
 		return
 	}
 
-	pods, err := rc.Client.ListPods("")
+	pods, err := list(rc.Informers.pods(), rc.Client.ListPods)
 	if err != nil {
 		log.Printf("replicaset controller: %v", err)
 		return
@@ -93,7 +67,7 @@ func (rc *ReplicaSetController) reconcileAll() {
 	owned := make(map[string][]api.Pod)
 	for _, pod := range pods {
 		if pod.ControlledBy("ReplicaSet") {
-			owner := api.Key(pod.Namespace, pod.Owner)
+			owner := api.Key(pod.Namespace, pod.OwnerName())
 			owned[owner] = append(owned[owner], pod)
 		}
 	}
@@ -116,13 +90,17 @@ func (rc *ReplicaSetController) reconcileAll() {
 			continue
 		}
 		for _, pod := range pods {
-			rc.deletePod(pod, fmt.Sprintf("its replicaset %q is gone", pod.Owner))
+			rc.deletePod(pod, fmt.Sprintf("its replicaset %q is gone", pod.OwnerName()))
 		}
 	}
 }
 
 // reconcile makes one ReplicaSet's pods match the number of replicas it wants.
 func (rc *ReplicaSetController) reconcile(rs api.ReplicaSet, pods []api.Pod) {
+	if !rc.expected.satisfied(api.Key(rs.Namespace, rs.Name)) {
+		return // the pods may not show our last changes yet
+	}
+
 	var alive []api.Pod
 	for _, pod := range pods {
 		if isAlive(pod) {
@@ -213,13 +191,14 @@ func (rc *ReplicaSetController) backingOff(rs api.ReplicaSet) bool {
 
 // createPod creates one new pod from the ReplicaSet's template.
 func (rc *ReplicaSetController) createPod(rs api.ReplicaSet) {
-	pod := newPod(newPodName(rs.Name), rs.Namespace, rs.Template, "ReplicaSet", rs.Name)
+	pod := newPod(newPodName(rs.Name), rs.Template, "ReplicaSet", rs.ObjectMeta)
 
 	err := rc.Client.CreatePod(pod)
 	if err != nil {
 		log.Printf("replicaset %s: %v", api.Key(rs.Namespace, rs.Name), err)
 		return
 	}
+	expectPresent(&rc.expected, rc.Informers.pods(), api.Key(rs.Namespace, rs.Name), pod.Namespace, pod.Name)
 	log.Printf("replicaset %s: created pod %q", api.Key(rs.Namespace, rs.Name), pod.Name)
 	rc.events().Normal("ReplicaSet", rs.Namespace, rs.Name, "SuccessfulCreate", "created pod %q", pod.Name)
 }
@@ -231,9 +210,10 @@ func (rc *ReplicaSetController) deletePod(pod api.Pod, reason string) {
 		log.Printf("replicaset controller: %v", err)
 		return
 	}
+	expectGone(&rc.expected, rc.Informers.pods(), api.Key(pod.Namespace, pod.OwnerName()), pod.Namespace, pod.Name)
 	log.Printf("deleted pod %s: %s", api.Key(pod.Namespace, pod.Name), reason)
-	if pod.Owner != "" {
-		rc.events().Normal("ReplicaSet", pod.Namespace, pod.Owner, "SuccessfulDelete", "deleted pod %q: %s", pod.Name, reason)
+	if pod.ControlledBy("ReplicaSet") {
+		rc.events().Normal("ReplicaSet", pod.Namespace, pod.OwnerName(), "SuccessfulDelete", "deleted pod %q: %s", pod.Name, reason)
 	}
 }
 

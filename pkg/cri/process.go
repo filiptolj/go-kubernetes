@@ -1,7 +1,9 @@
 package cri
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -47,11 +49,21 @@ func (pr *ProcessRuntime) Start(pod api.Pod, c api.Container, opts Options) (Run
 	pr.procs[processKey(pod, c)] = cmd
 	pr.mu.Unlock()
 
-	running := Running{Done: done}
-	if c.Port != 0 {
-		running.Address = fmt.Sprintf("127.0.0.1:%d", c.Port)
+	running := Running{Done: done, HostPorts: make(map[int]string)}
+	for _, p := range c.Ports {
+		running.HostPorts[p.ContainerPort] = fmt.Sprintf("127.0.0.1:%d", p.ContainerPort)
 	}
+	running.Address = running.HostPorts[c.Port()]
 	return running, nil
+}
+
+// Exec runs the command as another process on this machine: a process
+// container has no inside of its own to run it in.
+func (pr *ProcessRuntime) Exec(ctx context.Context, pod api.Pod, c api.Container, command []string, stdin io.Reader, out io.Writer) (int, error) {
+	if len(command) == 0 {
+		return -1, fmt.Errorf("no command to run")
+	}
+	return runExec(exec.CommandContext(ctx, command[0], command[1:]...), stdin, out)
 }
 
 // RemoveAll does nothing: a new kubelet can't find the processes started by

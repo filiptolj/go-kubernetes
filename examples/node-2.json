@@ -1,7 +1,0 @@
-{
-    "kind": "Node",
-    "name": "node-2",
-    "cpu": 2,
-    "memory": 4096,
-    "ready": true
-}

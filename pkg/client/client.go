@@ -30,12 +30,14 @@ func New(baseURL string) *Client {
 }
 
 // listPath returns the URL path for listing one kind of namespaced object,
-// such as "pods": in one namespace, or in all of them if namespace is "".
-func listPath(namespace, kind string) string {
+// given its plural such as "pods": in one namespace, or in all of them if
+// namespace is "". The path starts with the kind's API group, as in
+// Kubernetes: /api/v1/namespaces/default/pods, /apis/apps/v1/deployments.
+func listPath(namespace, plural string) string {
 	if namespace == "" {
-		return "/api/" + kind
+		return api.Prefix(plural) + "/" + plural
 	}
-	return "/api/namespaces/" + url.PathEscape(namespace) + "/" + kind
+	return api.Prefix(plural) + "/namespaces/" + url.PathEscape(namespace) + "/" + plural
 }
 
 // objectPath returns the URL path of one namespaced object. PathEscape makes
@@ -106,55 +108,15 @@ func (c *Client) SetPodStatus(namespace, name string, status api.PodStatus) erro
 	return nil
 }
 
-// WatchPods opens a watch on the pods of every namespace. Events arrive on
-// the returned channel until ctx is cancelled or the connection breaks, then
-// it is closed.
+// WatchPods opens a watch on the pods of every namespace. See Watch.
 func (c *Client) WatchPods(ctx context.Context) (<-chan api.PodEvent, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/watch/pods", nil)
-	if err != nil {
-		return nil, fmt.Errorf("watch pods: %w", err)
-	}
-
-	// No timeout here: a watch is meant to stay open for a long time.
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("watch pods: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		return nil, fmt.Errorf("watch pods: %w", statusError(resp))
-	}
-
-	events := make(chan api.PodEvent)
-
-	go func() {
-		defer close(events)
-		defer resp.Body.Close()
-
-		dec := json.NewDecoder(resp.Body)
-		for {
-			var event api.PodEvent
-			err := dec.Decode(&event)
-			if err != nil {
-				return
-			}
-
-			select {
-			case events <- event:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return events, nil
+	return Watch[api.Pod](ctx, c, listPath("", "pods"))
 }
 
 // ListNodes fetches every node.
 func (c *Client) ListNodes() ([]api.Node, error) {
 	var nodes []api.Node
-	err := c.get("/api/nodes", &nodes)
+	err := c.get("/api/v1/nodes", &nodes)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -163,7 +125,7 @@ func (c *Client) ListNodes() ([]api.Node, error) {
 
 // CreateNode sends a new node to the API server.
 func (c *Client) CreateNode(node api.Node) error {
-	err := c.send(http.MethodPost, "/api/nodes", node, http.StatusCreated)
+	err := c.send(http.MethodPost, "/api/v1/nodes", node, http.StatusCreated)
 	if err != nil {
 		return fmt.Errorf("create node: %w", err)
 	}
@@ -173,7 +135,7 @@ func (c *Client) CreateNode(node api.Node) error {
 // PutNode creates or replaces a node. Kubelets use it to register their node
 // and to send heartbeats.
 func (c *Client) PutNode(node api.Node) error {
-	err := c.send(http.MethodPut, "/api/nodes/"+url.PathEscape(node.Name), node, http.StatusOK)
+	err := c.send(http.MethodPut, "/api/v1/nodes/"+url.PathEscape(node.Name), node, http.StatusOK)
 	if err != nil {
 		return fmt.Errorf("put node %q: %w", node.Name, err)
 	}
@@ -182,7 +144,7 @@ func (c *Client) PutNode(node api.Node) error {
 
 // SetNodeReady marks a node Ready or NotReady.
 func (c *Client) SetNodeReady(name string, ready bool) error {
-	err := c.send(http.MethodPost, "/api/nodes/"+url.PathEscape(name)+"/status", api.NodeStatus{Ready: ready}, http.StatusOK)
+	err := c.send(http.MethodPost, "/api/v1/nodes/"+url.PathEscape(name)+"/status", api.NodeStatus{Ready: ready}, http.StatusOK)
 	if err != nil {
 		return fmt.Errorf("set node %q ready: %w", name, err)
 	}

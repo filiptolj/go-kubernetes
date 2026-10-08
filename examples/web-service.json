@@ -1,6 +1,0 @@
-{
-  "kind": "Service",
-  "name": "web",
-  "port": 8081,
-  "selector": { "app": "web" }
-}

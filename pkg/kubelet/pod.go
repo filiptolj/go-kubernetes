@@ -3,9 +3,12 @@ package kubelet
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -20,11 +23,12 @@ type runningPod struct {
 	wg     sync.WaitGroup     // the container loops, so stopping can wait for them
 
 	// The fields below are guarded by Kubelet.mu.
-	stopping   bool                       // the kubelet is stopping it on purpose
-	containers map[string]*containerState // by container name
-	restarts   int
-	reason     string       // such as "CrashLoopBackOff"
-	phase      api.PodPhase // "" while running; Succeeded or Failed once finished
+	stopping     bool                       // the kubelet is stopping it on purpose
+	containers   map[string]*containerState // by container name
+	restarts     int
+	reason       string       // such as "CrashLoopBackOff"
+	phase        api.PodPhase // "" while running; Succeeded or Failed once finished
+	initializing bool         // its init containers haven't all finished yet
 
 	// Status reports go out one at a time, so they can't arrive in the wrong
 	// order. reported is the last one sent, so unchanged ones aren't resent.
@@ -35,18 +39,20 @@ type runningPod struct {
 
 // containerState is how one container of a pod is doing.
 type containerState struct {
-	up      bool   // running right now
-	ready   bool   // passing its readiness check
-	address string // where its port is reachable, while it runs
-	done    bool   // exited for good: the restart policy says not to restart it
-	failed  bool   // it exited with an error, when done
+	up        bool           // running right now
+	ready     bool           // passing its readiness check
+	address   string         // where its first port is reachable, while it runs
+	hostPorts map[int]string // where each of its ports is reachable, by container port
+	done      bool           // exited for good: the restart policy says not to restart it
+	failed    bool           // it exited with an error, when done
 }
 
 func newRunningPod(pod api.Pod, cancel context.CancelFunc) *runningPod {
 	rp := &runningPod{pod: pod, cancel: cancel, containers: make(map[string]*containerState)}
-	for _, c := range pod.Containers {
+	for _, c := range slices.Concat(pod.InitContainers, pod.Containers) {
 		rp.containers[c.Name] = &containerState{}
 	}
+	rp.initializing = len(pod.InitContainers) > 0
 	return rp
 }
 
@@ -74,12 +80,76 @@ func (k *Kubelet) startPod(ctx context.Context, rp *runningPod) {
 
 	// No report yet: the pod stays Pending until its first container has
 	// started, and runOnce reports it Running.
-	for _, c := range pod.Containers {
-		rp.wg.Go(func() {
-			k.runContainer(ctx, rp, c, setups[c.Name])
-		})
+	rp.wg.Go(func() {
+		if !k.runInitContainers(ctx, rp, setups) {
+			return
+		}
+		for _, c := range pod.Containers {
+			rp.wg.Go(func() {
+				k.runContainer(ctx, rp, c, setups[c.Name])
+			})
+		}
+		go k.watchReadiness(ctx, rp)
+	})
+}
+
+// runInitContainers runs the pod's init containers one after the other,
+// each until it succeeds. The pod stays Pending meanwhile, with a reason
+// like "Init:1/2" (one of two done). An init container that fails is run
+// again after a delay, unless the pod's restart policy is Never: then the
+// pod fails. It reports whether the pod's other containers may start.
+func (k *Kubelet) runInitContainers(ctx context.Context, rp *runningPod, setups map[string]containerSetup) bool {
+	pod := rp.pod
+	total := len(pod.InitContainers)
+
+	for i, c := range pod.InitContainers {
+		delay := k.cfg.RestartDelay
+		for {
+			k.mu.Lock()
+			rp.reason = fmt.Sprintf("Init:%d/%d", i, total)
+			k.mu.Unlock()
+
+			exitErr := k.runOnce(ctx, rp, c, setups[c.Name])
+			if ctx.Err() != nil {
+				return false // the pod is being stopped
+			}
+			if exitErr == nil {
+				break
+			}
+
+			k.events.Warning("Pod", pod.Namespace, pod.Name, "Failed", "init container %q %s", c.Name, describeExit(exitErr))
+			if pod.RestartPolicy == api.RestartNever {
+				k.mu.Lock()
+				rp.reason = "Init:Error"
+				k.mu.Unlock()
+				log.Printf("pod %s finished: init container %q failed", api.Key(pod.Namespace, pod.Name), c.Name)
+				k.finish(rp, api.PodFailed)
+				return false
+			}
+
+			k.mu.Lock()
+			rp.reason = "Init:CrashLoopBackOff"
+			k.mu.Unlock()
+			k.report(rp)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return false
+			}
+			delay = min(delay*2, k.cfg.MaxRestartDelay)
+			k.mu.Lock()
+			rp.restarts++
+			k.mu.Unlock()
+		}
 	}
-	go k.watchReadiness(ctx, rp)
+
+	if total > 0 {
+		k.mu.Lock()
+		rp.initializing, rp.reason = false, ""
+		k.mu.Unlock()
+		k.events.Normal("Pod", pod.Namespace, pod.Name, "Initialized", "all %d init containers succeeded", total)
+	}
+	return true
 }
 
 // runContainer runs one container of a pod for as long as the pod lives.
@@ -95,6 +165,10 @@ func (k *Kubelet) runContainer(ctx context.Context, rp *runningPod, c api.Contai
 		exitErr := k.runOnce(ctx, rp, c, setup)
 		if ctx.Err() != nil {
 			return // the pod is being stopped
+		}
+		if exitReason(exitErr) == "OOMKilled" {
+			k.events.Warning("Pod", pod.Namespace, pod.Name, "OOMKilled",
+				"container %q used more memory than its limit of %s and was killed", c.Name, c.Resources.Limits[api.ResourceMemory])
 		}
 
 		if !shouldRestart(pod.RestartPolicy, exitErr) {
@@ -155,7 +229,7 @@ func (k *Kubelet) runOnce(ctx context.Context, rp *runningPod, c api.Container, 
 
 	k.mu.Lock()
 	state := rp.containers[c.Name]
-	state.up, state.address = true, running.Address
+	state.up, state.address, state.hostPorts = true, running.Address, running.HostPorts
 	restarts := rp.restarts
 	k.mu.Unlock()
 
@@ -178,7 +252,8 @@ func (k *Kubelet) runOnce(ctx context.Context, rp *runningPod, c api.Container, 
 // container's liveness probe, if it has one, and kills the container when the
 // probe fails too many times in a row.
 func (k *Kubelet) waitContainer(rp *runningPod, c api.Container, running cri.Running, started time.Time) error {
-	if c.LivenessProbe == nil || running.Address == "" {
+	p := c.LivenessProbe
+	if p == nil || (p.Exec == nil && running.Address == "") {
 		return <-running.Done
 	}
 
@@ -197,7 +272,7 @@ func (k *Kubelet) waitContainer(rp *runningPod, c api.Container, running cri.Run
 		if time.Since(started) < delay {
 			continue
 		}
-		if check(c.LivenessProbe, running.Address) {
+		if k.runProbe(rp.pod, c, p, running.Address) {
 			failures = 0
 			continue
 		}
@@ -229,6 +304,16 @@ func shouldRestart(policy api.RestartPolicy, exitErr error) bool {
 	}
 }
 
+// exitReason returns why a container exited, such as "OOMKilled", if the
+// runtime knows.
+func exitReason(err error) string {
+	var exit *cri.ExitError
+	if errors.As(err, &exit) {
+		return exit.Reason
+	}
+	return ""
+}
+
 // describeExit says how a container exited, for events.
 func describeExit(err error) string {
 	if err == nil {
@@ -248,6 +333,9 @@ func (k *Kubelet) containerDone(rp *runningPod, c api.Container, exitErr error) 
 	k.mu.Lock()
 	state := rp.containers[c.Name]
 	state.done, state.failed = true, exitErr != nil
+	if reason := exitReason(exitErr); reason != "" {
+		rp.reason = reason
+	}
 
 	allDone, anyFailed := true, false
 	for _, s := range rp.containers {
@@ -320,7 +408,9 @@ func (k *Kubelet) watchReadiness(ctx context.Context, rp *runningPod) {
 			}
 			lastCheck[c.Name] = time.Now()
 
-			ready := up && (c.Port == 0 || check(c.ReadinessProbe, address))
+			// Without a probe or a port there is nothing to check: running is ready.
+			unchecked := c.ReadinessProbe == nil && c.Port() == 0
+			ready := up && (unchecked || k.runProbe(rp.pod, c, c.ReadinessProbe, address))
 			k.mu.Lock()
 			state.ready = ready
 			k.mu.Unlock()
@@ -332,15 +422,24 @@ func (k *Kubelet) watchReadiness(ctx context.Context, rp *runningPod) {
 // status works out what the pod's status should say. The caller must hold k.mu.
 func (rp *runningPod) status() api.PodStatus {
 	if rp.phase != "" {
-		return api.PodStatus{Phase: rp.phase, Restarts: rp.restarts}
+		return api.PodStatus{Phase: rp.phase, Restarts: rp.restarts, Reason: rp.reason}
+	}
+	if rp.initializing {
+		return api.PodStatus{Phase: api.PodPending, Restarts: rp.restarts, Reason: rp.reason}
 	}
 
 	status := api.PodStatus{Phase: api.PodRunning, Ready: true, Restarts: rp.restarts, Reason: rp.reason}
 	for _, c := range rp.pod.Containers {
 		state := rp.containers[c.Name]
 		status.Ready = status.Ready && state.ready
-		if status.Address == "" && c.Port != 0 {
+		if status.Address == "" && c.Port() != 0 {
 			status.Address = state.address
+		}
+		for port, address := range state.hostPorts {
+			if status.HostPorts == nil {
+				status.HostPorts = make(map[int]string)
+			}
+			status.HostPorts[port] = address
 		}
 	}
 	return status
@@ -357,7 +456,7 @@ func (k *Kubelet) report(rp *runningPod) {
 	stopping := rp.stopping
 	k.mu.Unlock()
 
-	if stopping || (rp.reportedOnce && status == rp.reported) {
+	if stopping || (rp.reportedOnce && sameStatus(status, rp.reported)) {
 		return
 	}
 
@@ -402,4 +501,11 @@ func (k *Kubelet) openLog(pod api.Pod, c api.Container) (*os.File, error) {
 		return nil, err
 	}
 	return os.OpenFile(filepath.Join(dir, c.Name+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+}
+
+// sameStatus reports whether two pod statuses say the same. Go can't
+// compare a struct that holds a map with ==, so we compare field by field.
+func sameStatus(a, b api.PodStatus) bool {
+	return a.Phase == b.Phase && a.Ready == b.Ready && a.Address == b.Address &&
+		a.Restarts == b.Restarts && a.Reason == b.Reason && maps.Equal(a.HostPorts, b.HostPorts)
 }

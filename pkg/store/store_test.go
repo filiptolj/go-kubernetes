@@ -3,6 +3,8 @@ package store
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -12,15 +14,32 @@ import (
 // ns is the namespace the tests use.
 const ns = api.DefaultNamespace
 
+// meta returns the metadata of an object in ns.
+func meta(name string) api.ObjectMeta {
+	return metaIn(ns, name)
+}
+
+func metaIn(namespace, name string) api.ObjectMeta {
+	return api.ObjectMeta{Name: name, Namespace: namespace}
+}
+
+// service returns a Service with one port.
+func service(name string, port int, selector api.Labels, namespace string) api.Service {
+	return api.Service{
+		ObjectMeta:  metaIn(namespace, name),
+		ServiceSpec: api.ServiceSpec{Selector: selector, Ports: []api.ServicePort{{Port: port}}},
+	}
+}
+
 func TestCreatePodTwiceConflicts(t *testing.T) {
 	s := New()
 
-	err := s.CreatePod(api.Pod{Namespace: ns, Name: "nginx"})
+	_, err := s.CreatePod(api.Pod{ObjectMeta: meta("nginx")})
 	if err != nil {
 		t.Fatalf("first CreatePod: unexpected error: %v", err)
 	}
 
-	err = s.CreatePod(api.Pod{Namespace: ns, Name: "nginx"})
+	_, err = s.CreatePod(api.Pod{ObjectMeta: meta("nginx")})
 	if !errors.Is(err, ErrConflict) {
 		t.Errorf("second CreatePod: got error %v, want ErrConflict", err)
 	}
@@ -42,9 +61,9 @@ func TestBindPod(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := New()
-			s.PutNode(api.Node{Name: "node-1", Ready: true})
-			s.CreatePod(api.Pod{Namespace: ns, Name: "free"})
-			s.CreatePod(api.Pod{Namespace: ns, Name: "taken", NodeName: "node-1"})
+			s.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-1"}, NodeStatus: api.NodeStatus{Ready: true}})
+			s.CreatePod(api.Pod{ObjectMeta: meta("free")})
+			s.CreatePod(api.Pod{ObjectMeta: meta("taken"), PodSpec: api.PodSpec{NodeName: "node-1"}})
 
 			pod, err := s.BindPod(ns, tt.pod, tt.node)
 
@@ -72,12 +91,12 @@ func TestBindPod(t *testing.T) {
 
 func TestWatchSeesEveryChange(t *testing.T) {
 	s := New()
-	s.PutNode(api.Node{Name: "node-1", Ready: true})
+	s.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-1"}, NodeStatus: api.NodeStatus{Ready: true}})
 
-	events, stop := s.WatchPods()
+	events, stop := s.Watch("pods", "")
 	defer stop()
 
-	s.CreatePod(api.Pod{Namespace: ns, Name: "nginx"})
+	s.CreatePod(api.Pod{ObjectMeta: meta("nginx")})
 	s.BindPod(ns, "nginx", "node-1")
 	s.SetPodStatus(ns, "nginx", api.PodStatus{Phase: api.PodRunning})
 	s.DeletePod(ns, "nginx")
@@ -85,19 +104,19 @@ func TestWatchSeesEveryChange(t *testing.T) {
 	want := []api.EventType{api.EventAdded, api.EventModified, api.EventModified, api.EventDeleted}
 	for i, wantType := range want {
 		event := <-events
-		if event.Type != wantType || event.Pod.Name != "nginx" {
-			t.Errorf("event %d: got %s %q, want %s \"nginx\"", i, event.Type, event.Pod.Name, wantType)
+		if event.Type != wantType || event.Object.(api.Pod).Name != "nginx" {
+			t.Errorf("event %d: got %s %q, want %s \"nginx\"", i, event.Type, event.Object.(api.Pod).Name, wantType)
 		}
 	}
 }
 
 func TestStoppedWatcherGetsNoMoreEvents(t *testing.T) {
 	s := New()
-	events, stop := s.WatchPods()
+	events, stop := s.Watch("pods", "")
 	stop()
 	stop() // stopping twice must be harmless
 
-	s.CreatePod(api.Pod{Namespace: ns, Name: "nginx"})
+	s.CreatePod(api.Pod{ObjectMeta: meta("nginx")})
 
 	_, ok := <-events
 	if ok {
@@ -114,7 +133,7 @@ func TestConcurrentCreates(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range 50 {
 		wg.Go(func() {
-			s.CreatePod(api.Pod{Namespace: ns, Name: fmt.Sprintf("pod-%d", i)})
+			s.CreatePod(api.Pod{ObjectMeta: meta(fmt.Sprintf("pod-%d", i))})
 		})
 	}
 	wg.Wait()
@@ -136,13 +155,20 @@ func TestSortedValues(t *testing.T) {
 
 func TestFinishedPodStaysFinished(t *testing.T) {
 	s := New()
-	s.CreatePod(api.Pod{Namespace: ns, Name: "job"})
+	s.CreatePod(api.Pod{ObjectMeta: meta("job")})
 	s.SetPodStatus(ns, "job", api.PodStatus{Phase: api.PodRunning, Ready: true})
 	s.SetPodStatus(ns, "job", api.PodStatus{Phase: api.PodFailed})
 
 	_, err := s.SetPodStatus(ns, "job", api.PodStatus{Phase: api.PodRunning, Ready: true})
 	if !errors.Is(err, ErrConflict) {
 		t.Errorf("Running after Failed: got error %v, want ErrConflict", err)
+	}
+
+	s.CreatePod(api.Pod{ObjectMeta: meta("done")})
+	s.SetPodStatus(ns, "done", api.PodStatus{Phase: api.PodSucceeded})
+	_, err = s.SetPodStatus(ns, "done", api.PodStatus{Phase: api.PodFailed})
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("Failed after Succeeded: got error %v, want ErrConflict", err)
 	}
 
 	pod, _ := s.GetPod(ns, "job")
@@ -187,5 +213,122 @@ func TestEventsAreCapped(t *testing.T) {
 	}
 	if events[0].Name != "p10" {
 		t.Errorf("oldest kept event is %q, want p10 (the 10 oldest dropped)", events[0].Name)
+	}
+}
+
+func TestCreateFillsInMetadata(t *testing.T) {
+	s := New()
+	s.CreatePod(api.Pod{ObjectMeta: meta("a")})
+	s.CreatePod(api.Pod{ObjectMeta: meta("b")})
+
+	a, _ := s.GetPod(ns, "a")
+	b, _ := s.GetPod(ns, "b")
+	if a.UID == "" || a.UID == b.UID {
+		t.Errorf("got UIDs %q and %q, want two different ones", a.UID, b.UID)
+	}
+	if a.CreationTimestamp.IsZero() {
+		t.Error("CreationTimestamp isn't set")
+	}
+	if a.ResourceVersion == "" || a.ResourceVersion == b.ResourceVersion {
+		t.Errorf("got resourceVersions %q and %q, want two different ones", a.ResourceVersion, b.ResourceVersion)
+	}
+}
+
+// TestStaleUpdateConflicts is optimistic concurrency: two clients read the
+// same version, and only the first one to write it back wins.
+func TestStaleUpdateConflicts(t *testing.T) {
+	s := New()
+	created, err := s.ConfigMaps.Create(api.ConfigMap{ObjectMeta: meta("settings"), Data: map[string]string{"mode": "slow"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, second := created, created
+	first.Data = map[string]string{"mode": "fast"}
+	second.Data = map[string]string{"mode": "medium"}
+
+	updated, err := s.ConfigMaps.Update(first)
+	if err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	if updated.ResourceVersion == created.ResourceVersion {
+		t.Error("the update didn't change the resourceVersion")
+	}
+	if updated.UID != created.UID {
+		t.Errorf("the update changed the UID from %q to %q", created.UID, updated.UID)
+	}
+
+	_, err = s.ConfigMaps.Update(second)
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("update from a stale copy: got error %v, want ErrConflict", err)
+	}
+	if cm, _ := s.ConfigMaps.Get(ns, "settings"); cm.Data["mode"] != "fast" {
+		t.Errorf("got mode %q, want the first update's \"fast\"", cm.Data["mode"])
+	}
+
+	// Without a resourceVersion, as from apply, the update always goes through.
+	second.ResourceVersion = ""
+	if _, err := s.ConfigMaps.Update(second); err != nil {
+		t.Errorf("update without a resourceVersion: %v", err)
+	}
+}
+
+func TestVersionsKeepGrowingAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	open := func() *Store {
+		b, err := OpenFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	first := open()
+	first.CreatePod(api.Pod{ObjectMeta: meta("a")})
+	a, _ := first.GetPod(ns, "a")
+	first.Close()
+
+	second := open()
+	defer second.Close()
+	second.CreatePod(api.Pod{ObjectMeta: meta("b")})
+	b, _ := second.GetPod(ns, "b")
+
+	av, _ := strconv.Atoi(a.ResourceVersion)
+	bv, _ := strconv.Atoi(b.ResourceVersion)
+	if bv <= av {
+		t.Errorf("after a restart, got version %d, want more than the saved %d", bv, av)
+	}
+}
+
+func TestWatchOneKindInOneNamespace(t *testing.T) {
+	s := New()
+	s.CreateNamespace(api.Namespace{ObjectMeta: metaIn("", "dev")})
+
+	events, stop := s.Watch("configmaps", "dev")
+	defer stop()
+
+	s.ConfigMaps.Create(api.ConfigMap{ObjectMeta: meta("not-in-dev")})
+	s.CreatePod(api.Pod{ObjectMeta: metaIn("dev", "not-a-configmap")})
+	created, _ := s.ConfigMaps.Create(api.ConfigMap{ObjectMeta: metaIn("dev", "settings")})
+	s.ConfigMaps.Delete("dev", "settings")
+
+	for _, want := range []api.EventType{api.EventAdded, api.EventDeleted} {
+		event := <-events
+		cm, ok := event.Object.(api.ConfigMap)
+		if event.Type != want || !ok || cm.Name != "settings" {
+			t.Fatalf("got %s %+v, want %s of configmap settings", event.Type, event.Object, want)
+		}
+		if cm.ResourceVersion != created.ResourceVersion {
+			t.Errorf("%s: got resourceVersion %q, want %q", want, cm.ResourceVersion, created.ResourceVersion)
+		}
+	}
+	select {
+	case event := <-events:
+		t.Errorf("got an extra event %s %+v", event.Type, event.Object)
+	default:
 	}
 }

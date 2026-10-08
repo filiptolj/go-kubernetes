@@ -1,0 +1,18 @@
+# A pod that tries to use 100Mi of memory with a limit of 20Mi. The kernel
+# kills it: `minikubectl get pods` shows OOMKilled.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hungry
+spec:
+  restartPolicy: Never
+  containers:
+  - name: main
+    image: busybox:1.36
+    # tail keeps everything it reads in memory until it sees a newline, and
+    # /dev/zero never sends one. The kernel kills tail, the biggest process,
+    # and the container exits with tail's status.
+    command: ["sh", "-c", "echo eating 100Mi of memory; head -c 100m /dev/zero | tail"]
+    resources:
+      limits:
+        memory: 20Mi

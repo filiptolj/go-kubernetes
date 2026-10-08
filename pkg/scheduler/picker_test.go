@@ -7,10 +7,17 @@ import (
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 )
 
-var twoNodes = []api.Node{
-	{Name: "node-1", Ready: true},
-	{Name: "node-2", Ready: true},
+// node returns a node with the given name and readiness.
+func node(name string, ready bool) api.Node {
+	return api.Node{ObjectMeta: api.ObjectMeta{Name: name}, NodeStatus: api.NodeStatus{Ready: ready}}
 }
+
+// on returns a pod bound to a node.
+func on(nodeName string) api.Pod {
+	return api.Pod{PodSpec: api.PodSpec{NodeName: nodeName}}
+}
+
+var twoNodes = []api.Node{node("node-1", true), node("node-2", true)}
 
 func TestLeastLoaded(t *testing.T) {
 	tests := []struct {
@@ -27,26 +34,26 @@ func TestLeastLoaded(t *testing.T) {
 		{
 			name:  "picks the node with fewer pods",
 			nodes: twoNodes,
-			pods:  []api.Pod{{NodeName: "node-1"}, {NodeName: "node-1"}, {NodeName: "node-2"}},
+			pods:  []api.Pod{on("node-1"), on("node-1"), on("node-2")},
 			want:  "node-2",
 		},
 		{
 			name:  "ignores pods that aren't scheduled",
 			nodes: twoNodes,
-			pods:  []api.Pod{{NodeName: ""}, {NodeName: ""}, {NodeName: "node-1"}},
+			pods:  []api.Pod{on(""), on(""), on("node-1")},
 			want:  "node-2",
 		},
 		{
 			name:  "skips nodes that aren't ready",
-			nodes: []api.Node{{Name: "node-1", Ready: false}, {Name: "node-2", Ready: true}},
-			pods:  []api.Pod{{NodeName: "node-2"}, {NodeName: "node-2"}},
+			nodes: []api.Node{node("node-1", false), node("node-2", true)},
+			pods:  []api.Pod{on("node-2"), on("node-2")},
 			want:  "node-2",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := (&LeastLoaded{}).Pick(api.Pod{Name: "new"}, tt.nodes, tt.pods)
+			got, err := (&LeastLoaded{}).Pick(api.Pod{ObjectMeta: api.ObjectMeta{Name: "new"}}, tt.nodes, tt.pods)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -79,7 +86,7 @@ func TestNoReadyNodes(t *testing.T) {
 		"least-loaded": &LeastLoaded{},
 		"round-robin":  &RoundRobin{},
 	}
-	notReady := []api.Node{{Name: "node-1", Ready: false}}
+	notReady := []api.Node{node("node-1", false)}
 
 	for name, picker := range pickers {
 		t.Run(name, func(t *testing.T) {

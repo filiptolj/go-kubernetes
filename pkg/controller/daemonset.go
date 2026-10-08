@@ -14,28 +14,34 @@ import (
 // It places the pods itself, by creating them already bound to their node:
 // the scheduler isn't involved.
 type DaemonSetController struct {
-	Client *client.Client
-	Every  time.Duration // how often to check
+	Client    *client.Client
+	Informers *Informers    // where to read from; nil: from Client
+	Every     time.Duration // how often to check even if nothing seems to change
+
+	expected expectations // pods created or deleted but not seen yet, by DaemonSet
 }
 
-// Run checks the DaemonSets every dc.Every until ctx is cancelled.
+// Run checks the DaemonSets whenever one of them, a node or a pod changes,
+// and every dc.Every, until ctx is cancelled.
 func (dc *DaemonSetController) Run(ctx context.Context) {
-	runEvery(ctx, dc.Every, dc.reconcileAll)
+	client.RunOnChange(ctx, "daemonset controller", dc.Every, dc.reconcileAll,
+		dc.Informers.daemonSets(), dc.Informers.nodes(), dc.Informers.pods())
 }
 
 // reconcileAll checks every DaemonSet, and removes pods whose DaemonSet is gone.
 func (dc *DaemonSetController) reconcileAll() {
-	sets, err := dc.Client.DaemonSets().List("")
+	dc.expected.check() // before reading: see expectations.go
+	sets, err := list(dc.Informers.daemonSets(), dc.Client.DaemonSets().List)
 	if err != nil {
 		log.Printf("daemonset controller: %v", err)
 		return
 	}
-	nodes, err := dc.Client.ListNodes()
+	nodes, err := list(dc.Informers.nodes(), allNodes(dc.Client))
 	if err != nil {
 		log.Printf("daemonset controller: %v", err)
 		return
 	}
-	pods, err := dc.Client.ListPods("")
+	pods, err := list(dc.Informers.pods(), dc.Client.ListPods)
 	if err != nil {
 		log.Printf("daemonset controller: %v", err)
 		return
@@ -54,7 +60,7 @@ func (dc *DaemonSetController) reconcileAll() {
 			continue
 		}
 		for _, pod := range pods {
-			dc.deletePod(pod, fmt.Sprintf("its daemonset %q is gone", pod.Owner))
+			dc.deletePod(pod, fmt.Sprintf("its daemonset %q is gone", pod.OwnerName()))
 		}
 	}
 }
@@ -62,6 +68,10 @@ func (dc *DaemonSetController) reconcileAll() {
 // reconcile makes sure every ready node runs exactly one pod of the
 // DaemonSet, from the current version of its template.
 func (dc *DaemonSetController) reconcile(ds api.DaemonSet, pods []api.Pod, nodes []api.Node) {
+	if !dc.expected.satisfied(api.Key(ds.Namespace, ds.Name)) {
+		return // the pods may not show our last changes yet
+	}
+
 	hash := templateHash(ds.Template)
 
 	onNode := make(map[string][]api.Pod)
@@ -125,7 +135,7 @@ func (dc *DaemonSetController) reconcile(ds api.DaemonSet, pods []api.Pod, nodes
 
 // createPod creates the DaemonSet's pod for one node, already bound to it.
 func (dc *DaemonSetController) createPod(ds api.DaemonSet, nodeName, hash string) {
-	pod := newPod(ds.Name+"-"+nodeName, ds.Namespace, ds.Template, "DaemonSet", ds.Name)
+	pod := newPod(ds.Name+"-"+nodeName, ds.Template, "DaemonSet", ds.ObjectMeta)
 	pod.Labels[templateHashLabel] = hash
 	pod.NodeName = nodeName
 
@@ -134,6 +144,7 @@ func (dc *DaemonSetController) createPod(ds api.DaemonSet, nodeName, hash string
 		log.Printf("daemonset %s: %v", api.Key(ds.Namespace, ds.Name), err)
 		return
 	}
+	expectPresent(&dc.expected, dc.Informers.pods(), api.Key(ds.Namespace, ds.Name), pod.Namespace, pod.Name)
 	log.Printf("daemonset %s: created pod %q on node %q", api.Key(ds.Namespace, ds.Name), pod.Name, nodeName)
 	dc.events().Normal("DaemonSet", ds.Namespace, ds.Name, "SuccessfulCreate", "created pod %q on node %q", pod.Name, nodeName)
 }
@@ -144,8 +155,9 @@ func (dc *DaemonSetController) deletePod(pod api.Pod, reason string) {
 		log.Printf("daemonset controller: %v", err)
 		return
 	}
+	expectGone(&dc.expected, dc.Informers.pods(), api.Key(pod.Namespace, pod.OwnerName()), pod.Namespace, pod.Name)
 	log.Printf("deleted pod %s: %s", api.Key(pod.Namespace, pod.Name), reason)
-	dc.events().Normal("DaemonSet", pod.Namespace, pod.Owner, "SuccessfulDelete", "deleted pod %q: %s", pod.Name, reason)
+	dc.events().Normal("DaemonSet", pod.Namespace, pod.OwnerName(), "SuccessfulDelete", "deleted pod %q: %s", pod.Name, reason)
 }
 
 // events returns the DaemonSet controller's event recorder.

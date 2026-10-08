@@ -47,19 +47,26 @@ func OpenFile(path string) (*FileBackend, error) {
 	for kind, list := range lists {
 		f.objects[kind] = make(map[string]json.RawMessage)
 		for _, data := range list {
-			// Every object has a "name" field, and some a "namespace". Read
-			// just those, to know the object's key.
+			// Every object has a name, and most a namespace, under
+			// "metadata". Read just those, to know the object's key. (Files
+			// from older versions had them at the top; reading those too
+			// lets the store report the old format clearly.)
 			var obj struct {
-				Name      string `json:"name"`
-				Namespace string `json:"namespace"`
+				api.ObjectMeta `json:"metadata"`
+				Name           string `json:"name"`
+				Namespace      string `json:"namespace"`
 			}
 			err := json.Unmarshal(data, &obj)
 			if err != nil {
 				return nil, fmt.Errorf("read %s: %w", path, err)
 			}
-			key := obj.Name
-			if obj.Namespace != "" {
-				key = api.Key(obj.Namespace, obj.Name)
+			name, namespace := obj.ObjectMeta.Name, obj.ObjectMeta.Namespace
+			if name == "" {
+				name, namespace = obj.Name, obj.Namespace
+			}
+			key := name
+			if namespace != "" {
+				key = api.Key(namespace, name)
 			}
 			f.objects[kind][key] = data
 		}

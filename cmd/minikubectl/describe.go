@@ -44,15 +44,7 @@ func (c *cli) describePod(name string) error {
 	field("Name", pod.Name)
 	field("Namespace", pod.Namespace)
 	field("Labels", formatLabels(pod.Labels))
-	if pod.Owner != "" {
-		kind := pod.OwnerKind
-		if kind == "" {
-			kind = "ReplicaSet"
-		}
-		field("Owner", kind+"/"+pod.Owner)
-	} else {
-		field("Owner", "<none>")
-	}
+	field("Owner", formatOwner(pod.ObjectMeta))
 	field("Node", orNone(pod.NodeName))
 	field("Status", podStatus(pod))
 	field("Ready", yesNo(pod.Ready))
@@ -67,8 +59,14 @@ func (c *cli) describePod(name string) error {
 		fmt.Printf("  %s:\n", ctr.Name)
 		fmt.Printf("    %-10s %s\n", "Image:", orNone(ctr.Image))
 		fmt.Printf("    %-10s %s\n", "Command:", orNone(strings.Join(ctr.Command, " ")))
-		if ctr.Port != 0 {
-			fmt.Printf("    %-10s %d\n", "Port:", ctr.Port)
+		if len(ctr.Ports) > 0 {
+			fmt.Printf("    %-10s %s\n", "Ports:", formatPorts(ctr.Ports))
+		}
+		if len(ctr.Resources.Requests) > 0 {
+			fmt.Printf("    %-10s %s\n", "Requests:", formatResources(ctr.Resources.Requests))
+		}
+		if len(ctr.Resources.Limits) > 0 {
+			fmt.Printf("    %-10s %s\n", "Limits:", formatResources(ctr.Resources.Limits))
 		}
 		for _, e := range ctr.Env {
 			value := e.Value
@@ -116,8 +114,8 @@ func (c *cli) describeNode(name string) error {
 	}
 	field("Name", node.Name)
 	field("Status", status)
-	field("CPU", fmt.Sprint(node.CPU))
-	field("Memory", fmt.Sprintf("%dMi", node.Memory))
+	field("CPU", orNone(node.Capacity["cpu"]))
+	field("Memory", orNone(node.Capacity["memory"]))
 	field("Kubelet", orNone(node.Address))
 	field("Heartbeat", formatTime(node.LastHeartbeat))
 
@@ -126,6 +124,19 @@ func (c *cli) describeNode(name string) error {
 	if err != nil {
 		return err
 	}
+
+	// What the pods still running here have requested, against what the node has.
+	var requested api.Resources
+	for _, pod := range pods {
+		if pod.NodeName == node.Name && pod.Phase != api.PodSucceeded && pod.Phase != api.PodFailed {
+			requested = requested.Add(pod.Requests())
+		}
+	}
+	capacity := api.ParseResources(node.Capacity)
+	field("Requested", fmt.Sprintf("cpu %s of %s, memory %s of %s",
+		api.FormatCPU(requested.CPU), orNone(node.Capacity["cpu"]),
+		api.FormatMemory(requested.Memory), orNone(node.Capacity["memory"]))+percentages(requested, capacity))
+
 	fmt.Println("Pods:")
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	count := 0
@@ -167,11 +178,7 @@ func (c *cli) describeReplicaSet(name string) error {
 
 	field("Name", rs.Name)
 	field("Namespace", rs.Namespace)
-	if rs.Owner != "" {
-		field("Owner", "Deployment/"+rs.Owner)
-	} else {
-		field("Owner", "<none>")
-	}
+	field("Owner", formatOwner(rs.ObjectMeta))
 	field("Replicas", fmt.Sprintf("%d desired, %d current", rs.Replicas, len(owned)))
 	printTemplate(rs.Template)
 
@@ -252,7 +259,7 @@ func (c *cli) describeService(name string) error {
 
 	field("Name", svc.Name)
 	field("Namespace", svc.Namespace)
-	field("Port", fmt.Sprint(svc.Port))
+	field("Ports", servicePorts(svc))
 	field("Selector", formatLabels(svc.Selector))
 
 	fmt.Println("Endpoints:")
@@ -346,12 +353,12 @@ func describeVolume(v api.Volume) string {
 	case v.ConfigMap != nil:
 		return "configmap " + v.ConfigMap.Name
 	default:
-		return "secret " + v.Secret.Name
+		return "secret " + v.Secret.SecretName
 	}
 }
 
 // printTemplate prints a pod template's labels and containers.
-func printTemplate(t api.PodTemplate) {
+func printTemplate(t api.PodTemplateSpec) {
 	fmt.Println("Pod template:")
 	fmt.Printf("  %-12s %s\n", "Labels:", formatLabels(t.Labels))
 	if t.RestartPolicy != "" {
@@ -362,11 +369,65 @@ func printTemplate(t api.PodTemplate) {
 		if len(ctr.Command) > 0 {
 			line += "  " + strings.Join(ctr.Command, " ")
 		}
-		if ctr.Port != 0 {
-			line += fmt.Sprintf("  (port %d)", ctr.Port)
+		if len(ctr.Ports) > 0 {
+			line += "  (ports " + formatPorts(ctr.Ports) + ")"
 		}
 		fmt.Printf("  %-12s %s\n", ctr.Name+":", line)
 	}
+}
+
+// formatResources returns a list of resources, like "cpu=250m, memory=64Mi".
+func formatResources(list api.ResourceList) string {
+	var parts []string
+	for _, name := range sortedKeys(list) {
+		parts = append(parts, name+"="+list[name])
+	}
+	return strings.Join(parts, ", ")
+}
+
+// percentages says how much of a node's capacity is requested, like
+// " (18%, 2%)", or "" if the node doesn't say how much it has.
+func percentages(requested, capacity api.Resources) string {
+	if capacity.CPU == 0 || capacity.Memory == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d%%, %d%%)", requested.CPU*100/capacity.CPU, requested.Memory*100/capacity.Memory)
+}
+
+// formatOwner returns "Kind/name" of the object that controls m, or "<none>".
+func formatOwner(m api.ObjectMeta) string {
+	ref, ok := m.Owner()
+	if !ok {
+		return "<none>"
+	}
+	return ref.Kind + "/" + ref.Name
+}
+
+// formatPorts returns a container's ports, like "80/http, 9090".
+func formatPorts(ports []api.ContainerPort) string {
+	var parts []string
+	for _, p := range ports {
+		s := fmt.Sprint(p.ContainerPort)
+		if p.Name != "" {
+			s += "/" + p.Name
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// servicePorts returns a Service's ports, like "8081->80, 9090": the
+// Service's port, then the pods' port when it is a different one.
+func servicePorts(svc api.Service) string {
+	var parts []string
+	for _, p := range svc.Ports {
+		s := fmt.Sprint(p.Port)
+		if p.Target() != p.Port {
+			s += fmt.Sprintf("->%d", p.Target())
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // printEvents prints the events about one object as a table.

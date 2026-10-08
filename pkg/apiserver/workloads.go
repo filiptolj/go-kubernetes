@@ -11,7 +11,7 @@ import (
 // handleListReplicaSets returns the ReplicaSets in the URL's namespace, or
 // in every namespace for GET /api/replicasets.
 func (s *server) handleListReplicaSets(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.ListReplicaSets(r.PathValue("namespace")))
+	writeList(w, r, s.store.ListReplicaSets(r.PathValue("namespace")))
 }
 
 // handleCreateReplicaSet reads a ReplicaSet from the request body and stores it.
@@ -29,13 +29,16 @@ func (s *server) handleCreateReplicaSet(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "replicas can't be negative", http.StatusBadRequest)
 		return
 	}
-	err := prepareTemplate(&rs.Template)
+	err := setKind(&rs.TypeMeta, "ReplicaSet")
+	if err == nil {
+		err = prepareTemplate(&rs.Template)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	err = s.store.CreateReplicaSet(rs)
+	rs, err = s.store.CreateReplicaSet(rs)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return
@@ -91,13 +94,17 @@ func validateDeployment(d *api.Deployment) error {
 	case len(d.Template.Labels) == 0:
 		return errors.New("template needs labels, so the deployment's pods can be found")
 	}
+	err := setKind(&d.TypeMeta, "Deployment")
+	if err != nil {
+		return err
+	}
 	return prepareTemplate(&d.Template)
 }
 
 // handleListDeployments returns the Deployments in the URL's namespace, or
 // in every namespace for GET /api/deployments.
 func (s *server) handleListDeployments(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.ListDeployments(r.PathValue("namespace")))
+	writeList(w, r, s.store.ListDeployments(r.PathValue("namespace")))
 }
 
 // handleCreateDeployment reads a Deployment from the request body and stores it.
@@ -113,7 +120,7 @@ func (s *server) handleCreateDeployment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.store.CreateDeployment(d)
+	d, err = s.store.CreateDeployment(d)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return
@@ -187,7 +194,7 @@ func (s *server) handleScaleDeployment(w http.ResponseWriter, r *http.Request) {
 // handleListServices returns the Services in the URL's namespace, or in
 // every namespace for GET /api/services.
 func (s *server) handleListServices(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.ListServices(r.PathValue("namespace")))
+	writeList(w, r, s.store.ListServices(r.PathValue("namespace")))
 }
 
 // handleCreateService reads a Service from the request body and stores it.
@@ -197,25 +204,26 @@ func (s *server) handleCreateService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch {
-	case svc.Name == "":
+	if svc.Name == "" {
 		http.Error(w, "service name is required", http.StatusBadRequest)
 		return
-	case svc.Port < 1 || svc.Port > 65535:
-		http.Error(w, "port must be between 1 and 65535", http.StatusBadRequest)
-		return
-	case len(svc.Selector) == 0:
-		http.Error(w, "selector is required, so the service can find its pods", http.StatusBadRequest)
+	}
+	err := setKind(&svc.TypeMeta, "Service")
+	if err == nil {
+		err = prepareService(&svc)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	err := s.store.CreateService(svc)
+	svc, err = s.store.CreateService(svc)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return
 	}
 
-	log.Printf("created service %s on port %d", api.Key(svc.Namespace, svc.Name), svc.Port)
+	log.Printf("created service %s", api.Key(svc.Namespace, svc.Name))
 	writeJSON(w, http.StatusCreated, svc)
 }
 

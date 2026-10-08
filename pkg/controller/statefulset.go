@@ -17,23 +17,29 @@ import (
 // it runs and is ready; they are removed in reverse order, one at a time; a
 // pod that is gone is created again with the same name.
 type StatefulSetController struct {
-	Client *client.Client
-	Every  time.Duration // how often to check
+	Client    *client.Client
+	Informers *Informers    // where to read from; nil: from Client
+	Every     time.Duration // how often to check even if nothing seems to change
+
+	expected expectations // pods created or deleted but not seen yet, by StatefulSet
 }
 
-// Run checks the StatefulSets every sc.Every until ctx is cancelled.
+// Run checks the StatefulSets whenever one of them or a pod changes, and
+// every sc.Every, until ctx is cancelled.
 func (sc *StatefulSetController) Run(ctx context.Context) {
-	runEvery(ctx, sc.Every, sc.reconcileAll)
+	client.RunOnChange(ctx, "statefulset controller", sc.Every, sc.reconcileAll,
+		sc.Informers.statefulSets(), sc.Informers.pods())
 }
 
 // reconcileAll checks every StatefulSet, and removes pods whose StatefulSet is gone.
 func (sc *StatefulSetController) reconcileAll() {
-	sets, err := sc.Client.StatefulSets().List("")
+	sc.expected.check() // before reading: see expectations.go
+	sets, err := list(sc.Informers.statefulSets(), sc.Client.StatefulSets().List)
 	if err != nil {
 		log.Printf("statefulset controller: %v", err)
 		return
 	}
-	pods, err := sc.Client.ListPods("")
+	pods, err := list(sc.Informers.pods(), sc.Client.ListPods)
 	if err != nil {
 		log.Printf("statefulset controller: %v", err)
 		return
@@ -52,7 +58,7 @@ func (sc *StatefulSetController) reconcileAll() {
 			continue
 		}
 		for _, pod := range pods {
-			sc.deletePod(pod, fmt.Sprintf("its statefulset %q is gone", pod.Owner))
+			sc.deletePod(pod, fmt.Sprintf("its statefulset %q is gone", pod.OwnerName()))
 		}
 	}
 }
@@ -71,6 +77,10 @@ func ordinal(ss api.StatefulSet, pod api.Pod) (n int, ok bool) {
 // reconcile takes one step towards the StatefulSet's desired state. Doing a
 // single step per check is what makes it go one pod at a time, in order.
 func (sc *StatefulSetController) reconcile(ss api.StatefulSet, pods []api.Pod) {
+	if !sc.expected.satisfied(api.Key(ss.Namespace, ss.Name)) {
+		return // the pods may not show our last step yet
+	}
+
 	hash := templateHash(ss.Template)
 
 	byOrdinal := make(map[int]api.Pod)
@@ -120,7 +130,7 @@ func (sc *StatefulSetController) reconcile(ss api.StatefulSet, pods []api.Pod) {
 }
 
 func (sc *StatefulSetController) createPod(ss api.StatefulSet, n int, hash string) {
-	pod := newPod(fmt.Sprintf("%s-%d", ss.Name, n), ss.Namespace, ss.Template, "StatefulSet", ss.Name)
+	pod := newPod(fmt.Sprintf("%s-%d", ss.Name, n), ss.Template, "StatefulSet", ss.ObjectMeta)
 	pod.Labels[templateHashLabel] = hash
 
 	err := sc.Client.CreatePod(pod)
@@ -128,6 +138,7 @@ func (sc *StatefulSetController) createPod(ss api.StatefulSet, n int, hash strin
 		log.Printf("statefulset %s: %v", api.Key(ss.Namespace, ss.Name), err)
 		return
 	}
+	expectPresent(&sc.expected, sc.Informers.pods(), api.Key(ss.Namespace, ss.Name), pod.Namespace, pod.Name)
 	log.Printf("statefulset %s: created pod %q", api.Key(ss.Namespace, ss.Name), pod.Name)
 	sc.events().Normal("StatefulSet", ss.Namespace, ss.Name, "SuccessfulCreate", "created pod %q", pod.Name)
 }
@@ -138,8 +149,9 @@ func (sc *StatefulSetController) deletePod(pod api.Pod, reason string) {
 		log.Printf("statefulset controller: %v", err)
 		return
 	}
+	expectGone(&sc.expected, sc.Informers.pods(), api.Key(pod.Namespace, pod.OwnerName()), pod.Namespace, pod.Name)
 	log.Printf("deleted pod %s: %s", api.Key(pod.Namespace, pod.Name), reason)
-	sc.events().Normal("StatefulSet", pod.Namespace, pod.Owner, "SuccessfulDelete", "deleted pod %q: %s", pod.Name, reason)
+	sc.events().Normal("StatefulSet", pod.Namespace, pod.OwnerName(), "SuccessfulDelete", "deleted pod %q: %s", pod.Name, reason)
 }
 
 // events returns the StatefulSet controller's event recorder.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
@@ -59,7 +60,7 @@ func (k *Kubelet) prepare(pod api.Pod) (map[string]containerSetup, error) {
 	}
 
 	setups := make(map[string]containerSetup)
-	for _, c := range pod.Containers {
+	for _, c := range slices.Concat(pod.InitContainers, pod.Containers) {
 		// Every container learns its pod's and node's names, as Kubernetes'
 		// "downward API" can provide.
 		env := []string{
@@ -134,11 +135,11 @@ type lookup struct {
 }
 
 // data returns the data of a ConfigMap (if cm is set) or a Secret.
-func (l *lookup) data(cm, secret *api.ObjectRef) (map[string]string, error) {
+func (l *lookup) data(cm *api.ConfigMapVolumeSource, secret *api.SecretVolumeSource) (map[string]string, error) {
 	if cm != nil {
 		return l.configMap(cm.Name)
 	}
-	return l.secret(secret.Name)
+	return l.secret(secret.SecretName)
 }
 
 // env returns the value an environment variable refers to.
@@ -187,9 +188,15 @@ func (l *lookup) secret(name string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A Secret's values are bytes; files and environment variables take text.
+	data := make(map[string]string)
+	for key, value := range s.Data {
+		data[key] = string(value)
+	}
+
 	if l.secrets == nil {
 		l.secrets = make(map[string]map[string]string)
 	}
-	l.secrets[name] = s.Data
-	return s.Data, nil
+	l.secrets[name] = data
+	return data, nil
 }

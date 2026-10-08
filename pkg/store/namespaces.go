@@ -10,21 +10,22 @@ import (
 )
 
 // CreateNamespace saves a new namespace.
-func (s *Store) CreateNamespace(ns api.Namespace) error {
+func (s *Store) CreateNamespace(ns api.Namespace) (api.Namespace, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	_, exists := s.namespaces[ns.Name]
 	if exists {
-		return fmt.Errorf("namespace %q already exists: %w", ns.Name, ErrConflict)
+		return api.Namespace{}, fmt.Errorf("namespace %q already exists: %w", ns.Name, ErrConflict)
 	}
 
-	err := s.put(kindNamespaces, ns.Name, ns)
+	s.stampNew(&ns.ObjectMeta)
+	err := s.put(api.EventAdded, kindNamespaces, ns.Name, ns)
 	if err != nil {
-		return err
+		return api.Namespace{}, err
 	}
 	s.namespaces[ns.Name] = ns
-	return nil
+	return ns, nil
 }
 
 // ListNamespaces returns every namespace, sorted by name.
@@ -77,7 +78,7 @@ func (s *Store) DeleteNamespace(name string) error {
 		}
 	}
 
-	err = s.remove(kindNamespaces, name)
+	err = s.remove(kindNamespaces, name, s.namespaces[name])
 	if err != nil {
 		return err
 	}
@@ -106,7 +107,7 @@ func (s *Store) checkNamespace(name string) error {
 // parameters of their own.
 func deleteAllIn[T any](s *Store, kind string, m map[string]T, namespace string) error {
 	for _, key := range keysIn(m, namespace) {
-		err := s.remove(kind, key)
+		err := s.remove(kind, key, m[key])
 		if err != nil {
 			return err
 		}

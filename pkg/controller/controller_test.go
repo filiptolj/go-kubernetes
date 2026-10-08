@@ -1,6 +1,9 @@
 package controller
 
 import (
+	"context"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -11,11 +14,11 @@ import (
 	"github.com/filiptolj/go-kubernetes/pkg/store"
 )
 
-// newTestCluster starts an API server in memory and returns its store, for
-// setting things up and checking results, and a client connected to it.
 // ns is the namespace the tests use.
 const ns = api.DefaultNamespace
 
+// newTestCluster starts an API server in memory and returns its store, for
+// setting things up and checking results, and a client connected to it.
 func newTestCluster(t *testing.T) (*store.Store, *client.Client) {
 	t.Helper()
 
@@ -26,11 +29,41 @@ func newTestCluster(t *testing.T) (*store.Store, *client.Client) {
 	return st, client.New(ts.URL)
 }
 
+// meta returns the metadata of an object in ns.
+func meta(name string) api.ObjectMeta {
+	return api.ObjectMeta{Name: name, Namespace: ns}
+}
+
+// tmpl returns a pod template with labels, running the given images.
+func tmpl(labels api.Labels, images ...string) api.PodTemplateSpec {
+	t := api.PodTemplateSpec{ObjectMeta: api.ObjectMeta{Labels: labels}}
+	for i, image := range images {
+		t.Containers = append(t.Containers, api.Container{Name: fmt.Sprintf("c%d", i), Image: image})
+	}
+	return t
+}
+
+// replicaSet returns a ReplicaSet in namespace.
+func replicaSet(namespace, name string, replicas int, t api.PodTemplateSpec) api.ReplicaSet {
+	return api.ReplicaSet{
+		ObjectMeta:     api.ObjectMeta{Name: name, Namespace: namespace},
+		ReplicaSetSpec: api.ReplicaSetSpec{Replicas: replicas, Template: t},
+	}
+}
+
+// ownedPod returns a pod in ns, in the given phase, controlled by an object
+// of kind.
+func ownedPod(name, kind, owner string, phase api.PodPhase) api.Pod {
+	pod := api.Pod{ObjectMeta: meta(name), PodStatus: api.PodStatus{Phase: phase}}
+	pod.SetOwner(kind, owner, "")
+	return pod
+}
+
 // alivePods returns the live pods that belong to a ReplicaSet.
 func alivePods(st *store.Store, owner string) []api.Pod {
 	var pods []api.Pod
 	for _, pod := range st.ListPods("") {
-		if pod.Owner == owner && isAlive(pod) {
+		if pod.OwnerName() == owner && isAlive(pod) {
 			pods = append(pods, pod)
 		}
 	}
@@ -41,12 +74,7 @@ func TestReplicaSetController(t *testing.T) {
 	st, c := newTestCluster(t)
 	rc := &ReplicaSetController{Client: c}
 
-	st.CreateReplicaSet(api.ReplicaSet{
-		Name:      "web",
-		Namespace: ns,
-		Replicas:  3,
-		Template:  api.PodTemplate{Containers: []api.Container{{Name: "nginx", Image: "nginx"}}},
-	})
+	st.CreateReplicaSet(replicaSet(ns, "web", 3, tmpl(nil, "nginx")))
 
 	// Too few pods: it creates them.
 	rc.reconcileAll()
@@ -91,9 +119,9 @@ func TestReplicaSetControllerRemovesPendingPodsFirst(t *testing.T) {
 	st, c := newTestCluster(t)
 	rc := &ReplicaSetController{Client: c}
 
-	st.CreateReplicaSet(api.ReplicaSet{Namespace: ns, Name: "web", Replicas: 1})
-	st.CreatePod(api.Pod{Namespace: ns, Name: "web-running", Owner: "web", Phase: api.PodRunning})
-	st.CreatePod(api.Pod{Namespace: ns, Name: "web-pending", Owner: "web", Phase: api.PodPending})
+	st.CreateReplicaSet(replicaSet(ns, "web", 1, tmpl(nil, "nginx")))
+	st.CreatePod(ownedPod("web-running", "ReplicaSet", "web", api.PodRunning))
+	st.CreatePod(ownedPod("web-pending", "ReplicaSet", "web", api.PodPending))
 
 	rc.reconcileAll()
 
@@ -119,11 +147,11 @@ func TestNodeController(t *testing.T) {
 			st, c := newTestCluster(t)
 			nc := &NodeController{Client: c, Timeout: tt.timeout}
 
-			st.PutNode(api.Node{Name: "node-1", Ready: true})
-			st.CreatePod(api.Pod{Namespace: ns, Name: "nginx", NodeName: "node-1", Phase: api.PodRunning})
+			st.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-1"}, NodeStatus: api.NodeStatus{Ready: true}})
+			st.CreatePod(api.Pod{ObjectMeta: meta("nginx"), PodSpec: api.PodSpec{NodeName: "node-1"}, PodStatus: api.PodStatus{Phase: api.PodRunning}})
 
 			// A node created with apply has no heartbeat and must be left alone.
-			st.CreateNode(api.Node{Name: "static", Ready: true})
+			st.CreateNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "static"}, NodeStatus: api.NodeStatus{Ready: true}})
 
 			time.Sleep(time.Millisecond) // let the heartbeat age past a 1ns timeout
 			nc.reconcile()
@@ -153,9 +181,7 @@ func TestReplicaSetBackoff(t *testing.T) {
 		HealthyAfter: time.Minute,
 	}
 
-	flaky := api.ReplicaSet{Namespace: ns, Name: "flaky", Replicas: 1, Template: api.PodTemplate{
-		Containers: []api.Container{{Name: "main", Image: "busybox"}},
-	}}
+	flaky := replicaSet(ns, "flaky", 1, tmpl(nil, "busybox"))
 	st.CreateReplicaSet(flaky)
 	rc.reconcileAll()
 
@@ -173,7 +199,7 @@ func TestReplicaSetBackoff(t *testing.T) {
 	wantDelays := []time.Duration{2 * time.Hour, 4 * time.Hour, 4 * time.Hour}
 	for i, wantDelay := range wantDelays {
 		before := time.Now()
-		rc.recordFailure(flaky, api.Pod{Namespace: ns, Name: "x"}) // never started, so it counts as a crash
+		rc.recordFailure(flaky, api.Pod{ObjectMeta: meta("x")}) // never started, so it counts as a crash
 
 		got := rc.backoff[api.Key(ns, "flaky")].until.Sub(before).Round(time.Minute)
 		if got != wantDelay {
@@ -183,7 +209,7 @@ func TestReplicaSetBackoff(t *testing.T) {
 
 	// A pod that ran for a long time before failing resets the count.
 	start := time.Now().Add(-2 * time.Minute)
-	rc.recordFailure(flaky, api.Pod{Namespace: ns, Name: "y", StartedAt: start, FinishedAt: time.Now()})
+	rc.recordFailure(flaky, api.Pod{ObjectMeta: meta("y"), PodStatus: api.PodStatus{StartedAt: start, FinishedAt: time.Now()}})
 	if f := rc.backoff[api.Key(ns, "flaky")].failures; f != 1 {
 		t.Errorf("after a pod that ran 2 minutes failed: %d failures in a row, want 1", f)
 	}
@@ -193,10 +219,7 @@ func TestReplicaSetCopiesLabels(t *testing.T) {
 	st, c := newTestCluster(t)
 	rc := &ReplicaSetController{Client: c}
 
-	st.CreateReplicaSet(api.ReplicaSet{Namespace: ns, Name: "web", Replicas: 1, Template: api.PodTemplate{
-		Labels:     api.Labels{"app": "web"},
-		Containers: []api.Container{{Name: "nginx", Image: "nginx"}},
-	}})
+	st.CreateReplicaSet(replicaSet(ns, "web", 1, tmpl(api.Labels{"app": "web"}, "nginx")))
 	rc.reconcileAll()
 
 	pod := alivePods(st, "web")[0]
@@ -219,10 +242,10 @@ func TestDeploymentRollingUpdate(t *testing.T) {
 	dc := &DeploymentController{Client: c}
 	rc := &ReplicaSetController{Client: c}
 
-	template := func(image string) api.PodTemplate {
-		return api.PodTemplate{
-			Labels:     api.Labels{"app": "web"},
-			Containers: []api.Container{{Name: "nginx", Image: image}},
+	deployment := func(image string) api.Deployment {
+		return api.Deployment{
+			ObjectMeta:     meta("web"),
+			DeploymentSpec: api.DeploymentSpec{Replicas: 3, Template: tmpl(api.Labels{"app": "web"}, image)},
 		}
 	}
 
@@ -233,17 +256,17 @@ func TestDeploymentRollingUpdate(t *testing.T) {
 		runPods(st)
 	}
 
-	st.CreateDeployment(api.Deployment{Namespace: ns, Name: "web", Replicas: 3, Template: template("nginx:1.27")})
+	st.CreateDeployment(deployment("nginx:1.27"))
 	step()
 
 	sets := st.ListReplicaSets("")
-	if len(sets) != 1 || sets[0].Replicas != 3 || sets[0].Owner != "web" {
+	if len(sets) != 1 || sets[0].Replicas != 3 || !sets[0].OwnedBy("Deployment", "web") {
 		t.Fatalf("after creating the deployment: got replicasets %+v, want one with 3 replicas", sets)
 	}
 	oldName := sets[0].Name
 
 	// Change the image: the rolling update begins.
-	st.UpdateDeployment(api.Deployment{Namespace: ns, Name: "web", Replicas: 3, Template: template("nginx:1.28")})
+	st.UpdateDeployment(deployment("nginx:1.28"))
 
 	for i := range 20 {
 		step()
@@ -287,9 +310,9 @@ func TestDeploymentRollingUpdate(t *testing.T) {
 }
 
 func TestTemplateHash(t *testing.T) {
-	a := api.PodTemplate{Labels: api.Labels{"app": "web"}, Containers: []api.Container{{Name: "c", Image: "nginx:1.27"}}}
-	b := api.PodTemplate{Labels: api.Labels{"app": "web"}, Containers: []api.Container{{Name: "c", Image: "nginx:1.27"}}}
-	changed := api.PodTemplate{Labels: api.Labels{"app": "web"}, Containers: []api.Container{{Name: "c", Image: "nginx:1.28"}}}
+	a := tmpl(api.Labels{"app": "web"}, "nginx:1.27")
+	b := tmpl(api.Labels{"app": "web"}, "nginx:1.27")
+	changed := tmpl(api.Labels{"app": "web"}, "nginx:1.28")
 
 	if templateHash(a) != templateHash(b) {
 		t.Error("identical templates got different hashes")
@@ -304,11 +327,10 @@ func TestTemplateHash(t *testing.T) {
 func TestNamespacesKeepTheirPods(t *testing.T) {
 	st, c := newTestCluster(t)
 	rc := &ReplicaSetController{Client: c}
-	st.CreateNamespace(api.Namespace{Name: "dev"})
+	st.CreateNamespace(api.Namespace{ObjectMeta: api.ObjectMeta{Name: "dev"}})
 
-	template := api.PodTemplate{Containers: []api.Container{{Name: "nginx", Image: "nginx"}}}
-	st.CreateReplicaSet(api.ReplicaSet{Namespace: "default", Name: "web", Replicas: 3, Template: template})
-	st.CreateReplicaSet(api.ReplicaSet{Namespace: "dev", Name: "web", Replicas: 1, Template: template})
+	st.CreateReplicaSet(replicaSet("default", "web", 3, tmpl(nil, "nginx")))
+	st.CreateReplicaSet(replicaSet("dev", "web", 1, tmpl(nil, "nginx")))
 
 	rc.reconcileAll()
 	rc.reconcileAll()
@@ -324,4 +346,80 @@ func TestNamespacesKeepTheirPods(t *testing.T) {
 			t.Errorf("pod %s of dev/web was created in namespace %q", pod.Name, pod.Namespace)
 		}
 	}
+}
+
+// TestControllersWithInformers runs the ReplicaSet and Deployment controllers
+// the way the controller-manager does: reading from informers, and woken up
+// by their changes. Their caches lag behind the API server, so without
+// expectations the controllers would create too many pods and ReplicaSets.
+func TestControllersWithInformers(t *testing.T) {
+	// Watches deliver every event 100ms late, so the informers really do lag.
+	st := store.New()
+	ts := httptest.NewServer(slowWatches(apiserver.NewHandler(st), 100*time.Millisecond))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel) // before ts.Close, which waits for the watches to end
+
+	informers := NewInformers(c)
+	go informers.Run(ctx)
+	rc := &ReplicaSetController{Client: c, Informers: informers, Resync: time.Hour}
+	dc := &DeploymentController{Client: c, Informers: informers, Every: time.Hour}
+	go rc.Run(ctx)
+	go dc.Run(ctx)
+
+	// Count every pod ever created, not only the ones still there.
+	created := 0
+	events, stop := st.Watch("pods", "")
+	defer stop()
+
+	st.CreateDeployment(api.Deployment{
+		ObjectMeta:     meta("web"),
+		DeploymentSpec: api.DeploymentSpec{Replicas: 5, Template: tmpl(api.Labels{"app": "web"}, "nginx")},
+	})
+
+	deadline := time.After(2 * time.Second)
+	for done := false; !done; {
+		select {
+		case event := <-events:
+			if event.Type == api.EventAdded {
+				created++
+			}
+		case <-deadline:
+			done = true
+		}
+	}
+
+	if created != 5 {
+		t.Errorf("created %d pods, want exactly 5", created)
+	}
+	if sets := st.ListReplicaSets(ns); len(sets) != 1 {
+		t.Errorf("got %d replicasets, want 1", len(sets))
+	}
+}
+
+// slowWatches wraps an API server so that watches deliver each event late.
+func slowWatches(h http.Handler, delay time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("watch") == "true" {
+			w = &slowWriter{ResponseWriter: w, delay: delay}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+type slowWriter struct {
+	http.ResponseWriter
+	delay time.Duration
+}
+
+func (w *slowWriter) Write(p []byte) (int, error) {
+	time.Sleep(w.delay)
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap lets http.NewResponseController reach the real writer, to flush it.
+func (w *slowWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

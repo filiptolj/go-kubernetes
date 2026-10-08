@@ -22,17 +22,21 @@ const (
 
 // CronJobController creates a Job whenever a CronJob is due.
 type CronJobController struct {
-	Client *client.Client
-	Every  time.Duration // how often to check
+	Client    *client.Client
+	Informers *Informers    // where to read from; nil: from Client
+	Every     time.Duration // how often to check
 
 	// Now returns the current time. Tests set it to control the clock; nil
 	// means time.Now.
 	Now func() time.Time
+
+	expected expectations // Jobs and status changes not seen yet, by CronJob
 }
 
-// Run checks the CronJobs every cc.Every until ctx is cancelled.
+// Run checks the CronJobs whenever a CronJob or a Job changes, and every
+// cc.Every (schedules depend on the time), until ctx is cancelled.
 func (cc *CronJobController) Run(ctx context.Context) {
-	runEvery(ctx, cc.Every, cc.reconcileAll)
+	client.RunOnChange(ctx, "cronjob controller", cc.Every, cc.reconcileAll, cc.Informers.cronJobs(), cc.Informers.jobs())
 }
 
 func (cc *CronJobController) now() time.Time {
@@ -44,12 +48,13 @@ func (cc *CronJobController) now() time.Time {
 
 // reconcileAll checks every CronJob, and removes Jobs whose CronJob is gone.
 func (cc *CronJobController) reconcileAll() {
-	cronJobs, err := cc.Client.CronJobs().List("")
+	cc.expected.check() // before reading: see expectations.go
+	cronJobs, err := list(cc.Informers.cronJobs(), cc.Client.CronJobs().List)
 	if err != nil {
 		log.Printf("cronjob controller: %v", err)
 		return
 	}
-	jobs, err := cc.Client.Jobs().List("")
+	jobs, err := list(cc.Informers.jobs(), cc.Client.Jobs().List)
 	if err != nil {
 		log.Printf("cronjob controller: %v", err)
 		return
@@ -57,8 +62,8 @@ func (cc *CronJobController) reconcileAll() {
 
 	owned := make(map[string][]api.Job) // by the CronJob's "namespace/name"
 	for _, job := range jobs {
-		if job.Owner != "" {
-			owner := api.Key(job.Namespace, job.Owner)
+		if job.ControlledBy("CronJob") {
+			owner := api.Key(job.Namespace, job.OwnerName())
 			owned[owner] = append(owned[owner], job)
 		}
 	}
@@ -75,13 +80,17 @@ func (cc *CronJobController) reconcileAll() {
 			continue
 		}
 		for _, job := range jobs {
-			cc.deleteJob(job, fmt.Sprintf("its cronjob %q is gone", job.Owner))
+			cc.deleteJob(job, fmt.Sprintf("its cronjob %q is gone", job.OwnerName()))
 		}
 	}
 }
 
 // reconcile creates a Job if the CronJob is due, and deletes old finished Jobs.
 func (cc *CronJobController) reconcile(cj api.CronJob, jobs []api.Job) {
+	if !cc.expected.satisfied(api.Key(cj.Namespace, cj.Name)) {
+		return // the informers may not show our last changes yet
+	}
+
 	now := cc.now()
 	schedule, err := cron.Parse(cj.Schedule)
 	if err != nil {
@@ -122,10 +131,11 @@ func (cc *CronJobController) reconcile(cj api.CronJob, jobs []api.Job) {
 func (cc *CronJobController) createJob(cj api.CronJob, due time.Time) {
 	name := fmt.Sprintf("%s-%d", cj.Name, due.Unix()/60)
 	job := api.Job{
-		Meta:    api.Meta{Name: name, Namespace: cj.Namespace},
-		JobSpec: cj.JobTemplate,
-		Owner:   cj.Name,
+		TypeMeta:   api.TypeMetaFor("Job"),
+		ObjectMeta: api.ObjectMeta{Name: name, Namespace: cj.Namespace},
+		JobSpec:    cj.JobTemplate.Spec,
 	}
+	job.SetOwner("CronJob", cj.Name, cj.UID)
 
 	err := cc.Client.Jobs().Create(cj.Namespace, job)
 	if errors.Is(err, client.ErrConflict) {
@@ -135,6 +145,7 @@ func (cc *CronJobController) createJob(cj api.CronJob, due time.Time) {
 		log.Printf("cronjob %s: %v", api.Key(cj.Namespace, cj.Name), err)
 		return
 	}
+	expectPresent(&cc.expected, cc.Informers.jobs(), api.Key(cj.Namespace, cj.Name), cj.Namespace, name)
 	log.Printf("cronjob %s: created job %q", api.Key(cj.Namespace, cj.Name), name)
 	cc.events().Normal("CronJob", cj.Namespace, cj.Name, "SuccessfulCreate", "created job %q", name)
 }
@@ -144,7 +155,9 @@ func (cc *CronJobController) saveLastSchedule(cj api.CronJob, t time.Time) {
 	err := cc.Client.CronJobs().UpdateStatus(cj.Namespace, cj.Name, cj)
 	if err != nil {
 		log.Printf("cronjob controller: %v", err)
+		return
 	}
+	expectNewVersion(&cc.expected, cc.Informers.cronJobs(), api.Key(cj.Namespace, cj.Name), cj.Namespace, cj.Name, cj.ResourceVersion)
 }
 
 // cleanUp deletes all but the newest few finished Jobs of a CronJob.

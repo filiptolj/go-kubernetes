@@ -16,7 +16,7 @@ const usage = `usage: minikubectl [-server URL] <command> [-n namespace | -A]
 
 commands:
   get <resource> [-w for pods]
-  apply -f <file.json>
+  apply -f <file or folder>          YAML or JSON, several objects per file
   create namespace <name>
   delete <resource> <name>
   scale replicaset|deployment|statefulset <name> <replicas>
@@ -110,9 +110,9 @@ func (c *cli) run(args []string) error {
 
 	case "apply":
 		if len(args) < 3 || args[1] != "-f" {
-			return errors.New("usage: minikubectl apply -f <file.json>")
+			return errors.New("usage: minikubectl apply -f <file or folder>")
 		}
-		return c.applyFile(args[2])
+		return c.applyPath(args[2])
 
 	case "create":
 		if len(args) < 3 || !isNamespace(args[1]) {

@@ -1,7 +1,6 @@
 package apiserver
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,7 +11,7 @@ import (
 // handleListPods returns the pods in the URL's namespace, or in every
 // namespace for GET /api/pods.
 func (s *server) handleListPods(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.ListPods(r.PathValue("namespace")))
+	writeList(w, r, s.store.ListPods(r.PathValue("namespace")))
 }
 
 // handleCreatePod reads a pod from the request body and stores it.
@@ -27,11 +26,15 @@ func (s *server) handleCreatePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err := setKind(&pod.TypeMeta, "Pod")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if pod.RestartPolicy == "" {
 		pod.RestartPolicy = api.RestartAlways
 	}
-	err := validatePodSpec(pod.Containers, pod.Volumes, pod.RestartPolicy,
-		api.RestartAlways, api.RestartOnFailure, api.RestartNever)
+	err = validatePodSpec(&pod.PodSpec, api.RestartAlways, api.RestartOnFailure, api.RestartNever)
 	if err != nil {
 		http.Error(w, "pod: "+err.Error(), http.StatusBadRequest)
 		return
@@ -39,7 +42,7 @@ func (s *server) handleCreatePod(w http.ResponseWriter, r *http.Request) {
 
 	pod.Phase = api.PodPending
 
-	err = s.store.CreatePod(pod)
+	pod, err = s.store.CreatePod(pod)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return
@@ -118,38 +121,4 @@ func (s *server) handleSetPodStatus(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("pod %s is now %s", api.Key(pod.Namespace, pod.Name), pod.Phase)
 	writeJSON(w, http.StatusOK, pod)
-}
-
-// handleWatchPods keeps the connection open and sends one JSON event per line
-// every time a pod changes, in any namespace, until the client disconnects.
-func (s *server) handleWatchPods(w http.ResponseWriter, r *http.Request) {
-	events, stop := s.store.WatchPods()
-	defer stop()
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	rc := http.NewResponseController(w)
-	rc.Flush()
-
-	log.Printf("watch started")
-	enc := json.NewEncoder(w)
-
-	for {
-		select {
-		case event, ok := <-events:
-			if !ok {
-				log.Printf("watch dropped: client too slow")
-				return
-			}
-			err := enc.Encode(event)
-			if err != nil {
-				return
-			}
-			rc.Flush()
-		case <-r.Context().Done():
-			log.Printf("watch ended")
-			return
-		}
-	}
 }

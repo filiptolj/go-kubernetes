@@ -16,13 +16,20 @@ import (
 // than Timeout, it marks the node NotReady and fails the pods on it, so they
 // can be replaced on another node.
 type NodeController struct {
-	Client  *client.Client
-	Timeout time.Duration // how long a node may go without a heartbeat
-	Every   time.Duration // how often to check
+	Client    *client.Client
+	Informers *Informers    // where to read from; nil: from Client
+	Timeout   time.Duration // how long a node may go without a heartbeat
+	Every     time.Duration // how often to check
 }
 
-// Run checks the nodes every nc.Every until ctx is cancelled.
+// Run checks the nodes every nc.Every until ctx is cancelled. Missing
+// heartbeats are about time passing, not about something changing, so it
+// doesn't react to changes; it only waits for its informers to fill first.
 func (nc *NodeController) Run(ctx context.Context) {
+	if !nc.Informers.nodes().WaitForSync(ctx) || !nc.Informers.pods().WaitForSync(ctx) {
+		return
+	}
+
 	ticker := time.NewTicker(nc.Every)
 	defer ticker.Stop()
 
@@ -38,13 +45,13 @@ func (nc *NodeController) Run(ctx context.Context) {
 
 // reconcile marks silent nodes NotReady and fails the live pods on NotReady nodes.
 func (nc *NodeController) reconcile() {
-	nodes, err := nc.Client.ListNodes()
+	nodes, err := list(nc.Informers.nodes(), allNodes(nc.Client))
 	if err != nil {
 		log.Printf("node controller: %v", err)
 		return
 	}
 
-	pods, err := nc.Client.ListPods("") // every namespace
+	pods, err := list(nc.Informers.pods(), nc.Client.ListPods)
 	if err != nil {
 		log.Printf("node controller: %v", err)
 		return

@@ -1,8 +1,0 @@
-{
-  "kind": "ConfigMap",
-  "name": "app-config",
-  "data": {
-    "greeting": "Hello from a ConfigMap",
-    "app.conf": "color = blue\nsize = large\n"
-  }
-}

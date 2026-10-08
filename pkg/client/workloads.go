@@ -11,7 +11,7 @@ import (
 // ListNamespaces fetches every namespace.
 func (c *Client) ListNamespaces() ([]api.Namespace, error) {
 	var namespaces []api.Namespace
-	err := c.get("/api/namespaces", &namespaces)
+	err := c.get("/api/v1/namespaces", &namespaces)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
 	}
@@ -20,7 +20,8 @@ func (c *Client) ListNamespaces() ([]api.Namespace, error) {
 
 // CreateNamespace creates a namespace.
 func (c *Client) CreateNamespace(name string) error {
-	err := c.send(http.MethodPost, "/api/namespaces", api.Namespace{Name: name}, http.StatusCreated)
+	ns := api.Namespace{TypeMeta: api.TypeMetaFor("Namespace"), ObjectMeta: api.ObjectMeta{Name: name}}
+	err := c.send(http.MethodPost, "/api/v1/namespaces", ns, http.StatusCreated)
 	if err != nil {
 		return fmt.Errorf("create namespace %q: %w", name, err)
 	}
@@ -29,7 +30,7 @@ func (c *Client) CreateNamespace(name string) error {
 
 // DeleteNamespace deletes a namespace and everything in it.
 func (c *Client) DeleteNamespace(name string) error {
-	err := c.send(http.MethodDelete, "/api/namespaces/"+url.PathEscape(name), nil, http.StatusOK)
+	err := c.send(http.MethodDelete, "/api/v1/namespaces/"+url.PathEscape(name), nil, http.StatusOK)
 	if err != nil {
 		return fmt.Errorf("delete namespace %q: %w", name, err)
 	}

@@ -14,7 +14,7 @@ It was built as a learning project: to understand how Kubernetes works by
 building it, and to learn Go along the way. It is not meant for production.
 
 ```
-$ minikubectl apply -f examples/web-deployment.json
+$ minikubectl apply -f examples/web-deployment.yaml
 deployment/web created in namespace default
 
 $ minikubectl get pods
@@ -81,15 +81,15 @@ deleted. The cluster itself is saved in `data/apiserver.json`.
 In a second terminal:
 
 ```bash
-./bin/minikubectl apply -f examples/web-deployment.json   # 3 nginx pods
-./bin/minikubectl apply -f examples/web-service.json      # one address for them, on port 8081
+./bin/minikubectl apply -f examples/web-deployment.yaml   # 3 nginx pods
+./bin/minikubectl apply -f examples/web-service.yaml      # one address for them, on port 8081
 ./bin/minikubectl get pods -w                             # watch them start (Ctrl+C to stop watching)
 
 curl http://localhost:8081                                # "Welcome to nginx!", from one of the pods
 ```
 
 Try a rolling update: change `nginx:1.27` to `nginx:1.28` in
-`examples/web-deployment.json` and apply it again. The pods are replaced one at
+`examples/web-deployment.yaml` and apply it again. The pods are replaced one at
 a time, and `curl` keeps working throughout.
 
 ### More examples
@@ -99,15 +99,15 @@ with `get`, `describe` and `logs`:
 
 | File | Shows |
 |---|---|
-| `job.json` | a Job: 3 pods must succeed, 2 run at a time |
-| `cronjob.json` | a CronJob that runs a Job every minute |
-| `statefulset.json` | `db-0`, `db-1`, `db-2`, created one after the other |
-| `daemonset.json` | one pod per node, printing its node's name |
-| `configmap.json`, `secret.json`, `configured-pod.json` | settings and a password as environment variables and files (apply in this order) |
-| `shared-volume.json` | two containers sharing an `emptyDir`: one writes a web page, nginx serves it |
-| `liveness.json` | nginx with a liveness probe on a page that doesn't exist: watch it get restarted |
-| `crash.json`, `hello.json` | pods with `restartPolicy: Never`, which fail or finish once |
-| `web-rs.json`, `flaky-rs.json` | ReplicaSets, one of them crashing every 10 seconds |
+| `job.yaml` | a Job: 3 pods must succeed, 2 run at a time |
+| `cronjob.yaml` | a CronJob that runs a Job every minute |
+| `statefulset.yaml` | `db-0`, `db-1`, `db-2`, created one after the other |
+| `daemonset.yaml` | one pod per node, printing its node's name |
+| `configmap.yaml`, `secret.yaml`, `configured-pod.yaml` | settings and a password as environment variables and files (apply in this order) |
+| `shared-volume.yaml` | two containers sharing an `emptyDir`: one writes a web page, nginx serves it |
+| `liveness.yaml` | nginx with a liveness probe on a page that doesn't exist: watch it get restarted |
+| `crash.yaml`, `hello.yaml` | pods with `restartPolicy: Never`, which fail or finish once |
+| `web-rs.yaml`, `flaky-rs.yaml` | ReplicaSets, one of them crashing every 10 seconds |
 
 `minik8s` takes a few options:
 
@@ -149,7 +149,7 @@ $ docker exec minik8s-etcd etcdctl get --prefix /minik8s/ --keys-only
 |---|---|
 | `get <resource>` | list objects; `get pods -w` keeps watching for changes |
 | `describe <resource> <name>` | details and recent events |
-| `apply -f <file.json>` | create the object in a file; applying it again updates it |
+| `apply -f <file.yaml>` | create the object in a file; applying it again updates it |
 | `delete <resource> <name>` | delete an object; a namespace is deleted with everything in it |
 | `logs <pod> [-c container] [-f]` | a container's output; `-f` follows it |
 | `scale replicaset\|deployment\|statefulset <name> <n>` | change the number of replicas |

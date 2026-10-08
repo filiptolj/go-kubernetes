@@ -1,7 +1,10 @@
 package cri
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -27,7 +30,8 @@ func containerName(pod api.Pod, c api.Container) string {
 
 // Start runs `docker run` for the container. The docker process keeps running
 // as long as the container does, and exits with the container's exit code.
-// If the container has a Port, it is published on a free port of this machine.
+// Each of the container's ports is published on a free port of this machine,
+// and its resource limits become Docker's limits.
 //
 // Environment variables are passed in a file only the current user can read,
 // not on the command line, where anyone on the machine could see them with
@@ -43,21 +47,26 @@ func (dr DockerRuntime) Start(pod api.Pod, c api.Container, opts Options) (Runni
 	// crashed. It fails harmlessly if there is none.
 	exec.Command("docker", "rm", "-f", name).Run()
 
-	args := []string{"run", "--rm", "--name", name,
+	// No --rm: once the container exits, we ask Docker how it ended, and
+	// remove it ourselves after that.
+	args := []string{"run", "--name", name,
 		"--label", "minik8s.node=" + dr.Node,
 		"--label", "minik8s.namespace=" + pod.Namespace,
 		"--label", "minik8s.pod=" + pod.Name}
 
-	var address string
-	if c.Port != 0 {
+	hostPorts := make(map[int]string)
+	for _, p := range c.Ports {
 		hostPort, err := freePort()
 		if err != nil {
 			return Running{}, fmt.Errorf("container %q: find a free port: %w", c.Name, err)
 		}
-		// Connections to 127.0.0.1:hostPort on this machine reach c.Port inside the container.
-		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d", hostPort, c.Port))
-		address = fmt.Sprintf("127.0.0.1:%d", hostPort)
+		// Connections to 127.0.0.1:hostPort on this machine reach the port inside the container.
+		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d", hostPort, p.ContainerPort))
+		hostPorts[p.ContainerPort] = fmt.Sprintf("127.0.0.1:%d", hostPort)
 	}
+	address := hostPorts[c.Port()]
+
+	args = append(args, limitArgs(c.Resources.Limits)...)
 
 	for _, m := range opts.Mounts {
 		volume := m.HostPath + ":" + m.ContainerPath
@@ -92,19 +101,59 @@ func (dr DockerRuntime) Start(pod api.Pod, c api.Container, opts Options) (Runni
 		return Running{}, fmt.Errorf("start container %q: %w", c.Name, err)
 	}
 
-	if envFile == "" {
-		return Running{Done: done, Address: address}, nil
-	}
-
-	// Docker has read the file once the container runs, but we only know that
-	// for sure when it exits. Remove the file then, and pass the result on.
 	result := make(chan error, 1)
 	go func() {
 		err := <-done
-		os.Remove(envFile)
-		result <- err
+		// Docker has read the env file once the container runs, but we
+		// only know that for sure now.
+		if envFile != "" {
+			os.Remove(envFile)
+		}
+		result <- exitReason(name, err)
 	}()
-	return Running{Done: result, Address: address}, nil
+	return Running{Done: result, Address: address, HostPorts: hostPorts}, nil
+}
+
+// limitArgs turns a container's limits into `docker run` options. --cpus
+// limits CPU time: "0.5" lets it use half of one CPU. --memory makes the
+// kernel kill the container if it uses more; --memory-swap set to the same
+// amount stops it from swapping instead, so the limit really holds.
+func limitArgs(limits api.ResourceList) []string {
+	var args []string
+	r := api.ParseResources(limits)
+	if _, ok := limits[api.ResourceCPU]; ok && r.CPU > 0 {
+		args = append(args, fmt.Sprintf("--cpus=%.3f", float64(r.CPU)/1000))
+	}
+	if _, ok := limits[api.ResourceMemory]; ok && r.Memory > 0 {
+		args = append(args, fmt.Sprintf("--memory=%db", r.Memory), fmt.Sprintf("--memory-swap=%db", r.Memory))
+	}
+	return args
+}
+
+// exitReason asks Docker how a container that just exited ended, then
+// removes it. It returns err, with the reason filled in if the kernel killed
+// the container for using more memory than its limit.
+func exitReason(name string, err error) error {
+	out, inspectErr := exec.Command("docker", "inspect", "--format", "{{.State.OOMKilled}}", name).Output()
+	exec.Command("docker", "rm", "-f", name).Run()
+
+	var exit *ExitError
+	if errors.As(err, &exit) && inspectErr == nil && strings.TrimSpace(string(out)) == "true" {
+		exit.Reason = "OOMKilled"
+	}
+	return err
+}
+
+// Exec runs `docker exec` in the container. With stdin, it passes -i so the
+// command can read it.
+func (dr DockerRuntime) Exec(ctx context.Context, pod api.Pod, c api.Container, command []string, stdin io.Reader, out io.Writer) (int, error) {
+	args := []string{"exec"}
+	if stdin != nil {
+		args = append(args, "-i")
+	}
+	args = append(args, containerName(pod, c))
+	args = append(args, command...)
+	return runExec(exec.CommandContext(ctx, "docker", args...), stdin, out)
 }
 
 // Stop removes the container. Its `docker run` process then exits on its own.

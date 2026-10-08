@@ -21,67 +21,93 @@ type server struct {
 
 // NewHandler returns an http.Handler that serves the API, backed by st.
 //
-// Objects that live in a namespace are under /api/namespaces/{namespace}/,
-// like in real Kubernetes. Listing them without a namespace, such as
-// GET /api/pods, returns them from every namespace.
+// The URLs follow Kubernetes: the original kinds live under /api/v1, the
+// others under /apis/<group>/<version>, such as /apis/apps/v1 for
+// Deployments. Objects in a namespace are under .../namespaces/{namespace}/.
+// Listing a kind without a namespace, such as GET /api/v1/pods, returns
+// them from every namespace. Adding ?watch=true to a list turns it into a
+// watch: see serveWatch.
 func NewHandler(st *store.Store) http.Handler {
 	s := &server{store: st}
+
+	const core = "/api/v1"
+	apps := api.Prefix("deployments")
+	inNamespace := "/namespaces/{namespace}"
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
 
-	mux.HandleFunc("GET /api/namespaces", s.handleListNamespaces)
-	mux.HandleFunc("POST /api/namespaces", s.handleCreateNamespace)
-	mux.HandleFunc("DELETE /api/namespaces/{name}", s.handleDeleteNamespace)
+	mux.HandleFunc("GET "+core+"/namespaces", watchable(st, "namespaces", s.handleListNamespaces))
+	mux.HandleFunc("POST "+core+"/namespaces", s.handleCreateNamespace)
+	mux.HandleFunc("DELETE "+core+"/namespaces/{name}", s.handleDeleteNamespace)
 
-	mux.HandleFunc("GET /api/pods", s.handleListPods)
-	mux.HandleFunc("GET /api/watch/pods", s.handleWatchPods)
-	mux.HandleFunc("GET /api/namespaces/{namespace}/pods", s.handleListPods)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/pods", s.handleCreatePod)
-	mux.HandleFunc("GET /api/namespaces/{namespace}/pods/{name}", s.handleGetPod)
-	mux.HandleFunc("DELETE /api/namespaces/{namespace}/pods/{name}", s.handleDeletePod)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/pods/{name}/binding", s.handleBindPod)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/pods/{name}/status", s.handleSetPodStatus)
+	mux.HandleFunc("GET "+core+"/pods", watchable(st, "pods", s.handleListPods))
+	mux.HandleFunc("GET "+core+inNamespace+"/pods", watchable(st, "pods", s.handleListPods))
+	mux.HandleFunc("POST "+core+inNamespace+"/pods", s.handleCreatePod)
+	mux.HandleFunc("GET "+core+inNamespace+"/pods/{name}", s.handleGetPod)
+	mux.HandleFunc("DELETE "+core+inNamespace+"/pods/{name}", s.handleDeletePod)
+	mux.HandleFunc("POST "+core+inNamespace+"/pods/{name}/binding", s.handleBindPod)
+	mux.HandleFunc("POST "+core+inNamespace+"/pods/{name}/status", s.handleSetPodStatus)
 
-	mux.HandleFunc("GET /api/nodes", s.handleListNodes)
-	mux.HandleFunc("POST /api/nodes", s.handleCreateNode)
-	mux.HandleFunc("PUT /api/nodes/{name}", s.handlePutNode)
-	mux.HandleFunc("POST /api/nodes/{name}/status", s.handleSetNodeStatus)
+	mux.HandleFunc("GET "+core+"/nodes", watchable(st, "nodes", s.handleListNodes))
+	mux.HandleFunc("POST "+core+"/nodes", s.handleCreateNode)
+	mux.HandleFunc("PUT "+core+"/nodes/{name}", s.handlePutNode)
+	mux.HandleFunc("POST "+core+"/nodes/{name}/status", s.handleSetNodeStatus)
 
-	mux.HandleFunc("GET /api/replicasets", s.handleListReplicaSets)
-	mux.HandleFunc("GET /api/namespaces/{namespace}/replicasets", s.handleListReplicaSets)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/replicasets", s.handleCreateReplicaSet)
-	mux.HandleFunc("DELETE /api/namespaces/{namespace}/replicasets/{name}", s.handleDeleteReplicaSet)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/replicasets/{name}/scale", s.handleScaleReplicaSet)
+	mux.HandleFunc("GET "+core+"/services", watchable(st, "services", s.handleListServices))
+	mux.HandleFunc("GET "+core+inNamespace+"/services", watchable(st, "services", s.handleListServices))
+	mux.HandleFunc("POST "+core+inNamespace+"/services", s.handleCreateService)
+	mux.HandleFunc("DELETE "+core+inNamespace+"/services/{name}", s.handleDeleteService)
 
-	mux.HandleFunc("GET /api/deployments", s.handleListDeployments)
-	mux.HandleFunc("GET /api/namespaces/{namespace}/deployments", s.handleListDeployments)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/deployments", s.handleCreateDeployment)
-	mux.HandleFunc("PUT /api/namespaces/{namespace}/deployments/{name}", s.handleUpdateDeployment)
-	mux.HandleFunc("DELETE /api/namespaces/{namespace}/deployments/{name}", s.handleDeleteDeployment)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/deployments/{name}/scale", s.handleScaleDeployment)
+	mux.HandleFunc("GET "+core+"/events", s.handleListEvents)
+	mux.HandleFunc("POST "+core+"/events", s.handleRecordEvent)
 
-	mux.HandleFunc("GET /api/services", s.handleListServices)
-	mux.HandleFunc("GET /api/namespaces/{namespace}/services", s.handleListServices)
-	mux.HandleFunc("POST /api/namespaces/{namespace}/services", s.handleCreateService)
-	mux.HandleFunc("DELETE /api/namespaces/{namespace}/services/{name}", s.handleDeleteService)
+	mux.HandleFunc("GET "+apps+"/replicasets", watchable(st, "replicasets", s.handleListReplicaSets))
+	mux.HandleFunc("GET "+apps+inNamespace+"/replicasets", watchable(st, "replicasets", s.handleListReplicaSets))
+	mux.HandleFunc("POST "+apps+inNamespace+"/replicasets", s.handleCreateReplicaSet)
+	mux.HandleFunc("DELETE "+apps+inNamespace+"/replicasets/{name}", s.handleDeleteReplicaSet)
+	mux.HandleFunc("POST "+apps+inNamespace+"/replicasets/{name}/scale", s.handleScaleReplicaSet)
 
-	mux.HandleFunc("GET /api/events", s.handleListEvents)
-	mux.HandleFunc("POST /api/events", s.handleRecordEvent)
+	mux.HandleFunc("GET "+apps+"/deployments", watchable(st, "deployments", s.handleListDeployments))
+	mux.HandleFunc("GET "+apps+inNamespace+"/deployments", watchable(st, "deployments", s.handleListDeployments))
+	mux.HandleFunc("POST "+apps+inNamespace+"/deployments", s.handleCreateDeployment)
+	mux.HandleFunc("PUT "+apps+inNamespace+"/deployments/{name}", s.handleUpdateDeployment)
+	mux.HandleFunc("DELETE "+apps+inNamespace+"/deployments/{name}", s.handleDeleteDeployment)
+	mux.HandleFunc("POST "+apps+inNamespace+"/deployments/{name}/scale", s.handleScaleDeployment)
 
 	// The newer kinds all use the same generic routes.
-	serveResource(mux, "jobs", "job", st.Jobs, rules[api.Job]{
+	serveResource(mux, st, "jobs", "job", st.Jobs, rules[api.Job]{
+		kind:       "Job",
+		typeMeta:   func(j *api.Job) *api.TypeMeta { return &j.TypeMeta },
 		prepare:    prepareJob,
 		copyStatus: func(dst *api.Job, src api.Job) { dst.Status = src.Status },
 	})
-	serveResource(mux, "cronjobs", "cronjob", st.CronJobs, rules[api.CronJob]{
+	serveResource(mux, st, "cronjobs", "cronjob", st.CronJobs, rules[api.CronJob]{
+		kind:       "CronJob",
+		typeMeta:   func(c *api.CronJob) *api.TypeMeta { return &c.TypeMeta },
 		prepare:    prepareCronJob,
 		copyStatus: func(dst *api.CronJob, src api.CronJob) { dst.Status = src.Status },
 	})
-	serveResource(mux, "daemonsets", "daemonset", st.DaemonSets, rules[api.DaemonSet]{prepare: prepareDaemonSet})
-	serveResource(mux, "statefulsets", "statefulset", st.StatefulSets, rules[api.StatefulSet]{prepare: prepareStatefulSet})
-	serveResource(mux, "configmaps", "configmap", st.ConfigMaps, rules[api.ConfigMap]{prepare: prepareConfigMap})
-	serveResource(mux, "secrets", "secret", st.Secrets, rules[api.Secret]{prepare: prepareSecret})
+	serveResource(mux, st, "daemonsets", "daemonset", st.DaemonSets, rules[api.DaemonSet]{
+		kind:     "DaemonSet",
+		typeMeta: func(d *api.DaemonSet) *api.TypeMeta { return &d.TypeMeta },
+		prepare:  prepareDaemonSet,
+	})
+	serveResource(mux, st, "statefulsets", "statefulset", st.StatefulSets, rules[api.StatefulSet]{
+		kind:     "StatefulSet",
+		typeMeta: func(ss *api.StatefulSet) *api.TypeMeta { return &ss.TypeMeta },
+		prepare:  prepareStatefulSet,
+	})
+	serveResource(mux, st, "configmaps", "configmap", st.ConfigMaps, rules[api.ConfigMap]{
+		kind:     "ConfigMap",
+		typeMeta: func(c *api.ConfigMap) *api.TypeMeta { return &c.TypeMeta },
+		prepare:  prepareConfigMap,
+	})
+	serveResource(mux, st, "secrets", "secret", st.Secrets, rules[api.Secret]{
+		kind:     "Secret",
+		typeMeta: func(sec *api.Secret) *api.TypeMeta { return &sec.TypeMeta },
+		prepare:  prepareSecret,
+	})
 	return mux
 }
 
@@ -140,7 +166,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // handleListNodes returns all nodes as JSON.
 func (s *server) handleListNodes(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.ListNodes())
+	writeList(w, r, s.store.ListNodes())
 }
 
 // handleCreateNode reads a node from the request body and stores it.
@@ -154,8 +180,13 @@ func (s *server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node name is required", http.StatusBadRequest)
 		return
 	}
+	err := setKind(&node.TypeMeta, "Node")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	err := s.store.CreateNode(node)
+	node, err = s.store.CreateNode(node)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return
@@ -175,7 +206,12 @@ func (s *server) handlePutNode(w http.ResponseWriter, r *http.Request) {
 
 	// The name in the URL wins, so a kubelet can't update the wrong node by accident.
 	node.Name = r.PathValue("name")
-	node, err := s.store.PutNode(node)
+	err := setKind(&node.TypeMeta, "Node")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	node, err = s.store.PutNode(node)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return

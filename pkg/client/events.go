@@ -11,7 +11,7 @@ import (
 
 // RecordEvent sends an event to the API server.
 func (c *Client) RecordEvent(e api.Event) error {
-	err := c.send(http.MethodPost, "/api/events", e, http.StatusCreated)
+	err := c.send(http.MethodPost, "/api/v1/events", e, http.StatusCreated)
 	if err != nil {
 		return fmt.Errorf("record event: %w", err)
 	}
@@ -26,7 +26,7 @@ func (c *Client) ListEvents(namespace, kind, name string) ([]api.Event, error) {
 	query := url.Values{"namespace": {namespace}, "kind": {kind}, "name": {name}}
 
 	var events []api.Event
-	err := c.get("/api/events?"+query.Encode(), &events)
+	err := c.get("/api/v1/events?"+query.Encode(), &events)
 	if err != nil {
 		return nil, fmt.Errorf("list events: %w", err)
 	}

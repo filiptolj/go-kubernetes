@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -111,7 +112,7 @@ func (k *Kubelet) Run(ctx context.Context) error {
 		}
 		k.address = fmt.Sprintf("http://localhost:%d", l.Addr().(*net.TCPAddr).Port)
 
-		srv := &http.Server{Handler: k.logsHandler()}
+		srv := &http.Server{Handler: k.handler()}
 		go srv.Serve(l)
 		defer srv.Close()
 		log.Printf("serving container logs on %s", k.address)
@@ -170,10 +171,10 @@ func (k *Kubelet) sync(ctx context.Context) error {
 				return errors.New("lost connection to the API server")
 			}
 			if event.Type == api.EventDeleted {
-				k.stopPodLater(event.Pod)
+				k.stopPodLater(event.Object)
 				continue
 			}
-			k.handle(event.Pod)
+			k.handle(event.Object)
 		case <-resync.C:
 			err := k.syncAll()
 			if err != nil {
@@ -213,9 +214,16 @@ func (k *Kubelet) recover(pod api.Pod) {
 		return
 	}
 
+	// pod may come from a list made a moment ago, just before a pod of ours
+	// finished and was forgotten. Only a fresh copy can tell.
+	fresh, err := k.client.GetPod(pod.Namespace, pod.Name)
+	if err != nil || fresh.UID != pod.UID || fresh.Phase != api.PodRunning {
+		return
+	}
+
 	log.Printf("pod %s was left running by an earlier kubelet: failing it", key)
 	k.events.Warning("Pod", pod.Namespace, pod.Name, "Lost", "the kubelet on %s restarted while this pod ran; its containers are gone", k.cfg.NodeName)
-	err := k.client.SetPodPhase(pod.Namespace, pod.Name, api.PodFailed)
+	err = k.client.SetPodPhase(pod.Namespace, pod.Name, api.PodFailed)
 	if err != nil {
 		log.Printf("could not report pod %s as Failed: %v", key, err)
 	}
@@ -288,7 +296,7 @@ func (k *Kubelet) stopPod(pod api.Pod) bool {
 	k.events.Normal("Pod", pod.Namespace, pod.Name, "Killing", "stopping the pod's containers")
 
 	rp.cancel() // the container loops stop restarting
-	for _, c := range rp.pod.Containers {
+	for _, c := range slices.Concat(rp.pod.InitContainers, rp.pod.Containers) {
 		err := k.runtime.Stop(rp.pod, c)
 		if err != nil {
 			log.Printf("pod %s: %v", key, err)
@@ -313,14 +321,20 @@ func (k *Kubelet) shutdown() {
 	}
 	k.mu.Unlock()
 
+	// All at once: one after the other, a node with many pods can take
+	// longer than whoever is stopping the kubelet is willing to wait.
+	var wg sync.WaitGroup
 	for _, pod := range running {
-		if k.stopPod(pod) {
-			err := k.client.SetPodPhase(pod.Namespace, pod.Name, api.PodFailed)
-			if err != nil {
-				log.Printf("could not report pod %s as Failed: %v", api.Key(pod.Namespace, pod.Name), err)
+		wg.Go(func() {
+			if k.stopPod(pod) {
+				err := k.client.SetPodPhase(pod.Namespace, pod.Name, api.PodFailed)
+				if err != nil {
+					log.Printf("could not report pod %s as Failed: %v", api.Key(pod.Namespace, pod.Name), err)
+				}
 			}
-		}
+		})
 	}
+	wg.Wait()
 
 	err := k.heartbeat(false)
 	if err != nil {
@@ -343,11 +357,16 @@ func (k *Kubelet) isRunning(key string) bool {
 // heartbeat registers the node with the API server, or refreshes it.
 func (k *Kubelet) heartbeat(ready bool) error {
 	return k.client.PutNode(api.Node{
-		Name:    k.cfg.NodeName,
-		CPU:     k.cfg.CPU,
-		Memory:  k.cfg.Memory,
-		Ready:   ready,
-		Address: k.address,
+		TypeMeta:   api.TypeMetaFor("Node"),
+		ObjectMeta: api.ObjectMeta{Name: k.cfg.NodeName},
+		NodeStatus: api.NodeStatus{
+			Capacity: api.ResourceList{
+				"cpu":    fmt.Sprint(k.cfg.CPU),
+				"memory": fmt.Sprintf("%dMi", k.cfg.Memory),
+			},
+			Ready:   ready,
+			Address: k.address,
+		},
 	})
 }
 

@@ -34,6 +34,8 @@ type fakeRuntime struct {
 	starts    map[string]int         // how often each container was started
 	options   map[string]cri.Options // what each container last started with
 	addresses map[string]string      // address to report, by pod; "fake:<pod>" if not set
+	execCodes map[string]int         // exit code of commands run with Exec, by "pod/container"
+	execs     []string               // every command run with Exec
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -42,7 +44,30 @@ func newFakeRuntime() *fakeRuntime {
 		starts:    make(map[string]int),
 		options:   make(map[string]cri.Options),
 		addresses: make(map[string]string),
+		execCodes: make(map[string]int),
 	}
+}
+
+// Exec pretends to run a command: it copies stdin to out, says what it ran,
+// and exits with the code set in execCodes.
+func (f *fakeRuntime) Exec(ctx context.Context, pod api.Pod, c api.Container, command []string, stdin io.Reader, out io.Writer) (int, error) {
+	f.mu.Lock()
+	code := f.execCodes[pod.Name+"/"+c.Name]
+	f.execs = append(f.execs, strings.Join(command, " "))
+	f.mu.Unlock()
+
+	if stdin != nil {
+		io.Copy(out, stdin)
+	}
+	fmt.Fprintf(out, "ran %s\n", strings.Join(command, " "))
+	return code, nil
+}
+
+// setExitCode sets what Exec returns for one container.
+func (f *fakeRuntime) setExitCode(key string, code int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.execCodes[key] = code
 }
 
 func (f *fakeRuntime) Start(pod api.Pod, c api.Container, opts cri.Options) (cri.Running, error) {
@@ -61,7 +86,11 @@ func (f *fakeRuntime) Start(pod api.Pod, c api.Container, opts cri.Options) (cri
 	if !ok {
 		address = "fake:" + pod.Name
 	}
-	return cri.Running{Done: done, Address: address}, nil
+	running := cri.Running{Done: done, Address: address}
+	if c.Port() != 0 {
+		running.HostPorts = map[int]string{c.Port(): address}
+	}
+	return running, nil
 }
 
 func (f *fakeRuntime) Stop(pod api.Pod, c api.Container) error {
@@ -190,17 +219,18 @@ func (n *testNode) run(name string, change func(*api.Pod)) {
 	n.t.Helper()
 
 	pod := api.Pod{
-		Name:          name,
-		Namespace:     ns,
-		Containers:    []api.Container{{Name: "main", Image: "busybox"}},
-		RestartPolicy: api.RestartAlways,
-		Phase:         api.PodPending,
+		ObjectMeta: api.ObjectMeta{Name: name, Namespace: ns},
+		PodSpec: api.PodSpec{
+			Containers:    []api.Container{{Name: "main", Image: "busybox"}},
+			RestartPolicy: api.RestartAlways,
+		},
+		PodStatus: api.PodStatus{Phase: api.PodPending},
 	}
 	if change != nil {
 		change(&pod)
 	}
 
-	err := n.st.CreatePod(pod)
+	_, err := n.st.CreatePod(pod)
 	if err != nil {
 		n.t.Fatal(err)
 	}
@@ -253,6 +283,126 @@ func TestContainerCrashesWithRestartNever(t *testing.T) {
 
 	if starts := n.rt.startCount("crash/main"); starts != 1 {
 		t.Errorf("container started %d times, want 1: Never means no restarts", starts)
+	}
+}
+
+func TestOOMKilled(t *testing.T) {
+	n := startNode(t)
+	n.run("hungry", func(p *api.Pod) {
+		never(p)
+		p.Containers[0].Resources.Limits = api.ResourceList{"memory": "16Mi"}
+	})
+	n.waitPhase("hungry", api.PodRunning)
+
+	n.rt.exit("hungry/main", &cri.ExitError{Code: 137, Reason: "OOMKilled"})
+	n.waitPhase("hungry", api.PodFailed)
+
+	if reason := n.pod("hungry").Reason; reason != "OOMKilled" {
+		t.Errorf("got reason %q, want OOMKilled", reason)
+	}
+	var event bool
+	for _, e := range n.st.ListEvents(ns, "Pod", "hungry") {
+		event = event || (e.Reason == "OOMKilled" && strings.Contains(e.Message, "16Mi"))
+	}
+	if !event {
+		t.Error("expected an OOMKilled event that names the limit")
+	}
+}
+
+func TestInitContainersRunFirst(t *testing.T) {
+	n := startNode(t)
+	n.run("app", func(p *api.Pod) {
+		p.InitContainers = []api.Container{{Name: "setup", Image: "busybox"}}
+	})
+
+	waitFor(t, "the init container to start", func() bool { return n.rt.isRunning("app/setup") })
+	if pod := n.pod("app"); pod.Phase != api.PodPending || pod.Reason != "Init:0/1" {
+		t.Errorf("while initializing: got %s %q, want Pending Init:0/1", pod.Phase, pod.Reason)
+	}
+	if n.rt.startCount("app/main") != 0 {
+		t.Fatal("main started before the init container finished")
+	}
+
+	// It fails once: it runs again, and main still waits.
+	n.rt.exit("app/setup", errors.New("exit status 1"))
+	waitFor(t, "the init container to run again", func() bool { return n.rt.startCount("app/setup") == 2 })
+	if n.rt.startCount("app/main") != 0 {
+		t.Fatal("main started after the init container failed")
+	}
+
+	n.rt.exit("app/setup", nil)
+	n.waitPhase("app", api.PodRunning)
+	if !n.rt.isRunning("app/main") {
+		t.Error("main isn't running after the init container succeeded")
+	}
+}
+
+func TestFailedInitContainerWithRestartNever(t *testing.T) {
+	n := startNode(t)
+	n.run("app", func(p *api.Pod) {
+		never(p)
+		p.InitContainers = []api.Container{{Name: "setup", Image: "busybox"}}
+	})
+	waitFor(t, "the init container to start", func() bool { return n.rt.isRunning("app/setup") })
+
+	n.rt.exit("app/setup", errors.New("exit status 1"))
+	n.waitPhase("app", api.PodFailed)
+	if reason := n.pod("app").Reason; reason != "Init:Error" {
+		t.Errorf("got reason %q, want Init:Error", reason)
+	}
+	if n.rt.startCount("app/main") != 0 {
+		t.Error("main started although the init container failed")
+	}
+}
+
+func TestExecReadinessProbe(t *testing.T) {
+	n := startNode(t)
+	n.rt.setExitCode("app/main", 1)
+	n.run("app", func(p *api.Pod) {
+		p.Containers[0].ReadinessProbe = &api.Probe{
+			Exec:          &api.ExecAction{Command: []string{"test", "-f", "/tmp/ready"}},
+			PeriodSeconds: 1,
+		}
+	})
+	n.waitPhase("app", api.PodRunning)
+
+	time.Sleep(300 * time.Millisecond)
+	if n.pod("app").Ready {
+		t.Fatal("ready although the probe's command fails")
+	}
+
+	n.rt.setExitCode("app/main", 0)
+	waitFor(t, "the pod to become ready", func() bool { return n.pod("app").Ready })
+}
+
+func TestExecEndpoint(t *testing.T) {
+	n := startNode(t)
+	n.run("app", nil)
+	n.waitPhase("app", api.PodRunning)
+	n.rt.setExitCode("app/main", 3)
+
+	address := n.st.ListNodes()[0].Address
+	resp, err := http.Post(address+"/exec/default/app/main?command=echo&command=hi&stdin=true", "text/plain", strings.NewReader("input\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body) // the trailer arrives after the body
+
+	if string(body) != "input\nran echo hi\n" {
+		t.Errorf("got output %q", body)
+	}
+	if code := resp.Trailer.Get("X-Exit-Code"); code != "3" {
+		t.Errorf("got exit code %q, want 3", code)
+	}
+
+	resp, err = http.Post(address+"/exec/default/app/nope?command=ls", "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown container: got status %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -318,7 +468,7 @@ func TestPodBecomesReadyWhenItsPortAnswers(t *testing.T) {
 	n.rt.addresses["server"] = l.Addr().String()
 	n.rt.mu.Unlock()
 
-	n.run("server", func(p *api.Pod) { p.Containers[0].Port = 80 })
+	n.run("server", func(p *api.Pod) { p.Containers[0].Ports = []api.ContainerPort{{ContainerPort: 80}} })
 	waitFor(t, "pod server to be ready", func() bool { return n.pod("server").Ready })
 
 	if addr := n.pod("server").Address; addr != l.Addr().String() {
@@ -340,7 +490,7 @@ func TestLivenessProbeRestartsAnUnhealthyContainer(t *testing.T) {
 	n.rt.mu.Unlock()
 
 	n.run("sick", func(p *api.Pod) {
-		p.Containers[0].Port = 80
+		p.Containers[0].Ports = []api.ContainerPort{{ContainerPort: 80}}
 		p.Containers[0].LivenessProbe = &api.Probe{
 			HTTPGet:          &api.HTTPGetAction{Path: "/healthz"},
 			PeriodSeconds:    1,
@@ -364,17 +514,17 @@ func TestLivenessProbeRestartsAnUnhealthyContainer(t *testing.T) {
 func TestEnvironmentAndVolumes(t *testing.T) {
 	n := startNode(t)
 	n.st.ConfigMaps.Create(api.ConfigMap{
-		Meta: api.Meta{Name: "settings", Namespace: ns},
-		Data: map[string]string{"mode": "fast", "app.conf": "color=blue\n"},
+		ObjectMeta: api.ObjectMeta{Name: "settings", Namespace: ns},
+		Data:       map[string]string{"mode": "fast", "app.conf": "color=blue\n"},
 	})
 	n.st.Secrets.Create(api.Secret{
-		Meta: api.Meta{Name: "db", Namespace: ns},
-		Data: map[string]string{"password": "hunter2"},
+		ObjectMeta: api.ObjectMeta{Name: "db", Namespace: ns},
+		Data:       map[string][]byte{"password": []byte("hunter2")},
 	})
 
 	n.run("app", func(p *api.Pod) {
 		p.Volumes = []api.Volume{
-			{Name: "config", ConfigMap: &api.ObjectRef{Name: "settings"}},
+			{Name: "config", ConfigMap: &api.ConfigMapVolumeSource{Name: "settings"}},
 			{Name: "scratch", EmptyDir: &api.EmptyDirSource{}},
 		}
 		p.Containers[0].Env = []api.EnvVar{
@@ -459,8 +609,12 @@ func TestSameNameNewPod(t *testing.T) {
 
 func TestPodsOnOtherNodesAreIgnored(t *testing.T) {
 	n := startNode(t)
-	n.st.PutNode(api.Node{Name: "node-2", Ready: true})
-	n.st.CreatePod(api.Pod{Namespace: ns, Name: "elsewhere", Containers: []api.Container{{Name: "main"}}, Phase: api.PodPending})
+	n.st.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-2"}, NodeStatus: api.NodeStatus{Ready: true}})
+	n.st.CreatePod(api.Pod{
+		ObjectMeta: api.ObjectMeta{Name: "elsewhere", Namespace: ns},
+		PodSpec:    api.PodSpec{Containers: []api.Container{{Name: "main"}}},
+		PodStatus:  api.PodStatus{Phase: api.PodPending},
+	})
 	n.st.BindPod(ns, "elsewhere", "node-2")
 
 	time.Sleep(200 * time.Millisecond)

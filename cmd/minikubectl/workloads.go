@@ -24,13 +24,16 @@ func isSecret(r string) bool      { return r == "secrets" || r == "secret" }
 
 // applyResource reads an object of a newer kind from a file's data, puts it
 // in namespace, and creates it, or updates it if it already exists.
-func applyResource[T any](res *client.Resource[T], label string, data []byte, namespace string, meta func(*T) *api.Meta) error {
+func applyResource[T any, PT interface {
+	*T
+	GetObjectMeta() *api.ObjectMeta
+}](res *client.Resource[T], label string, data []byte, namespace string) error {
 	var obj T
 	err := json.Unmarshal(data, &obj)
 	if err != nil {
 		return err
 	}
-	m := meta(&obj)
+	m := PT(&obj).GetObjectMeta()
 	m.Namespace = namespace
 
 	err = res.Create(namespace, obj)
@@ -55,17 +58,17 @@ func applyResource[T any](res *client.Resource[T], label string, data []byte, na
 func (c *cli) applyWorkload(kind string, data []byte, namespace string) (bool, error) {
 	switch kind {
 	case "Job":
-		return true, applyResource(c.client.Jobs(), "job", data, namespace, func(j *api.Job) *api.Meta { return &j.Meta })
+		return true, applyResource(c.client.Jobs(), "job", data, namespace)
 	case "CronJob":
-		return true, applyResource(c.client.CronJobs(), "cronjob", data, namespace, func(cj *api.CronJob) *api.Meta { return &cj.Meta })
+		return true, applyResource(c.client.CronJobs(), "cronjob", data, namespace)
 	case "DaemonSet":
-		return true, applyResource(c.client.DaemonSets(), "daemonset", data, namespace, func(d *api.DaemonSet) *api.Meta { return &d.Meta })
+		return true, applyResource(c.client.DaemonSets(), "daemonset", data, namespace)
 	case "StatefulSet":
-		return true, applyResource(c.client.StatefulSets(), "statefulset", data, namespace, func(s *api.StatefulSet) *api.Meta { return &s.Meta })
+		return true, applyResource(c.client.StatefulSets(), "statefulset", data, namespace)
 	case "ConfigMap":
-		return true, applyResource(c.client.ConfigMaps(), "configmap", data, namespace, func(cm *api.ConfigMap) *api.Meta { return &cm.Meta })
+		return true, applyResource(c.client.ConfigMaps(), "configmap", data, namespace)
 	case "Secret":
-		return true, applyResource(c.client.Secrets(), "secret", data, namespace, func(s *api.Secret) *api.Meta { return &s.Meta })
+		return true, applyResource(c.client.Secrets(), "secret", data, namespace)
 	}
 	return false, nil
 }
@@ -110,9 +113,9 @@ func (c *cli) getWorkload(resource string) (bool, error) {
 	case isStatefulSet(resource):
 		return true, c.getStatefulSets()
 	case isConfigMap(resource):
-		return true, getData(c, c.client.ConfigMaps().List, func(cm api.ConfigMap) (api.Meta, int) { return cm.Meta, len(cm.Data) })
+		return true, getData(c, c.client.ConfigMaps().List, func(cm api.ConfigMap) (api.ObjectMeta, int) { return cm.ObjectMeta, len(cm.Data) })
 	case isSecret(resource):
-		return true, getData(c, c.client.Secrets().List, func(s api.Secret) (api.Meta, int) { return s.Meta, len(s.Data) })
+		return true, getData(c, c.client.Secrets().List, func(s api.Secret) (api.ObjectMeta, int) { return s.ObjectMeta, len(s.Data) })
 	}
 	return false, nil
 }
@@ -206,7 +209,7 @@ func (c *cli) getStatefulSets() error {
 // getData prints the table for ConfigMaps or Secrets: their names and how
 // many keys they hold. list and describe are passed in, so one function
 // serves both kinds.
-func getData[T any](c *cli, list func(string) ([]T, error), describe func(T) (api.Meta, int)) error {
+func getData[T any](c *cli, list func(string) ([]T, error), describe func(T) (api.ObjectMeta, int)) error {
 	objects, err := list(c.listNamespace())
 	if err != nil {
 		return err
@@ -288,9 +291,7 @@ func (c *cli) describeJob(name string) error {
 	}
 	field("Name", job.Name)
 	field("Namespace", job.Namespace)
-	if job.Owner != "" {
-		field("Owner", "CronJob/"+job.Owner)
-	}
+	field("Owner", formatOwner(job.ObjectMeta))
 	field("Completions", fmt.Sprintf("%d (%d at a time)", job.Completions, job.Parallelism))
 	field("Backoff", fmt.Sprintf("give up after %d failures", backoffLimit))
 	field("Status", fmt.Sprintf("%d active, %d succeeded, %d failed  %s",
@@ -319,13 +320,13 @@ func (c *cli) describeCronJob(name string) error {
 	field("Schedule", cj.Schedule)
 	field("Suspend", yesNo(cj.Suspend))
 	field("Last run", formatTime(cj.Status.LastScheduleTime))
-	printTemplate(cj.JobTemplate.Template)
+	printTemplate(cj.JobTemplate.Spec.Template)
 
 	fmt.Println("Jobs:")
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	count := 0
 	for _, job := range jobs {
-		if job.Owner == cj.Name {
+		if job.OwnedBy("CronJob", cj.Name) {
 			fmt.Fprintf(w, "  %s\t%d/%d\t%s\n", job.Name, job.Status.Succeeded, job.Completions, orNone(job.Status.Condition))
 			count++
 		}
@@ -401,7 +402,7 @@ func podStatus(pod api.Pod) string {
 }
 
 // sortedKeys returns a map's keys in order.
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	var keys []string
 	for key := range m {
 		keys = append(keys, key)

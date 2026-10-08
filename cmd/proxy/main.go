@@ -6,8 +6,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
+	"github.com/filiptolj/go-kubernetes/pkg/api"
 	"github.com/filiptolj/go-kubernetes/pkg/client"
 	"github.com/filiptolj/go-kubernetes/pkg/proxy"
 )
@@ -20,13 +22,20 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
+	c := client.New(*server)
 	p := &proxy.Proxy{
-		Client:   client.New(*server),
-		Every:    time.Second,
+		Client:   c,
+		Every:    10 * time.Second,
 		BindAddr: *bind,
+		Services: client.NewInformer[api.Service](c, "services"),
+		Pods:     client.NewInformer[api.Pod](c, "pods"),
 	}
 
 	log.Printf("proxy started")
-	p.Run(ctx)
+	var wg sync.WaitGroup
+	wg.Go(func() { p.Services.Run(ctx) })
+	wg.Go(func() { p.Pods.Run(ctx) })
+	wg.Go(func() { p.Run(ctx) })
+	wg.Wait()
 	log.Printf("proxy stopped")
 }

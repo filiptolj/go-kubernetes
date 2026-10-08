@@ -4,6 +4,9 @@
 package cri
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os/exec"
@@ -19,6 +22,11 @@ type Runtime interface {
 
 	// Stop kills a container that Start started.
 	Stop(pod api.Pod, c api.Container) error
+
+	// Exec runs a command inside a running container, with stdin (if not
+	// nil) as its input and its output written to out, and returns its
+	// exit code. The error is for when the command couldn't be run at all.
+	Exec(ctx context.Context, pod api.Pod, c api.Container, command []string, stdin io.Reader, out io.Writer) (int, error)
 
 	// RemoveAll removes every container left over from an earlier run of
 	// this kubelet, for example one that crashed.
@@ -43,12 +51,55 @@ type Mount struct {
 // Running is a container that Start started.
 type Running struct {
 	// Done receives the container's result when it exits: nil for exit code
-	// 0, an error otherwise.
+	// 0, otherwise an error, usually an *ExitError.
 	Done <-chan error
 
-	// Address is host:port where the container's Port can be reached from
-	// this machine. Empty if the container has no Port.
-	Address string
+	// HostPorts says where each of the container's ports can be reached from
+	// this machine, as host:port, by container port. Address is the same
+	// for its first port; it is empty if the container has no ports.
+	HostPorts map[int]string
+	Address   string
+}
+
+// ExitError is how a container ended when it didn't succeed.
+type ExitError struct {
+	Code   int    // its exit code
+	Reason string // why, if known, such as "OOMKilled"
+}
+
+func (e *ExitError) Error() string {
+	if e.Reason != "" {
+		return fmt.Sprintf("%s (exit code %d)", e.Reason, e.Code)
+	}
+	return fmt.Sprintf("exit code %d", e.Code)
+}
+
+// exitError turns the error of a finished process into an *ExitError, if it
+// says how the process exited.
+func exitError(err error) error {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return &ExitError{Code: exit.ExitCode()}
+	}
+	return err
+}
+
+// runExec runs cmd to completion and returns its exit code. An error means
+// it couldn't be run, or was stopped before it finished.
+func runExec(cmd *exec.Cmd, stdin io.Reader, out io.Writer) (int, error) {
+	cmd.Stdin = stdin
+	cmd.Stdout = out
+	cmd.Stderr = out
+	err := cmd.Run()
+
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() >= 0 {
+		return exit.ExitCode(), nil
+	}
+	if err != nil {
+		return -1, err
+	}
+	return 0, nil
 }
 
 // freePort asks the operating system for a TCP port that nobody is using.
@@ -81,7 +132,7 @@ func start(cmd *exec.Cmd, logs io.Writer) (<-chan error, error) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- cmd.Wait()
+		done <- exitError(cmd.Wait())
 	}()
 	return done, nil
 }

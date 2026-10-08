@@ -10,10 +10,12 @@ import (
 )
 
 // busybox is a pod template for the tests.
-var busybox = api.PodTemplate{
-	Labels:        api.Labels{"app": "test"},
-	Containers:    []api.Container{{Name: "main", Image: "busybox"}},
-	RestartPolicy: api.RestartAlways,
+var busybox = api.PodTemplateSpec{
+	ObjectMeta: api.ObjectMeta{Labels: api.Labels{"app": "test"}},
+	PodSpec: api.PodSpec{
+		Containers:    []api.Container{{Name: "main", Image: "busybox"}},
+		RestartPolicy: api.RestartAlways,
+	},
 }
 
 // setPhase changes the phase of every pod in pods whose name is in names.
@@ -44,8 +46,8 @@ func TestJobRunsUntilEnoughSucceed(t *testing.T) {
 	template := busybox
 	template.RestartPolicy = api.RestartNever
 	st.Jobs.Create(api.Job{
-		Meta:    api.Meta{Name: "report", Namespace: ns},
-		JobSpec: api.JobSpec{Completions: 3, Parallelism: 2, BackoffLimit: intPtr(6), Template: template},
+		ObjectMeta: meta("report"),
+		JobSpec:    api.JobSpec{Completions: 3, Parallelism: 2, BackoffLimit: intPtr(6), Template: template},
 	})
 
 	jc.reconcileAll()
@@ -84,8 +86,8 @@ func TestJobGivesUpAfterTheBackoffLimit(t *testing.T) {
 	template := busybox
 	template.RestartPolicy = api.RestartNever
 	st.Jobs.Create(api.Job{
-		Meta:    api.Meta{Name: "flaky", Namespace: ns},
-		JobSpec: api.JobSpec{Completions: 1, Parallelism: 1, BackoffLimit: intPtr(1), Template: template},
+		ObjectMeta: meta("flaky"),
+		JobSpec:    api.JobSpec{Completions: 1, Parallelism: 1, BackoffLimit: intPtr(1), Template: template},
 	})
 
 	for range 2 {
@@ -113,9 +115,11 @@ func TestCronJob(t *testing.T) {
 	template := busybox
 	template.RestartPolicy = api.RestartNever
 	st.CronJobs.Create(api.CronJob{
-		Meta:        api.Meta{Name: "backup", Namespace: ns},
-		Schedule:    "*/5 * * * *",
-		JobTemplate: api.JobSpec{Completions: 1, Parallelism: 1, Template: template},
+		ObjectMeta: meta("backup"),
+		CronJobSpec: api.CronJobSpec{
+			Schedule:    "*/5 * * * *",
+			JobTemplate: api.JobTemplateSpec{Spec: api.JobSpec{Completions: 1, Parallelism: 1, Template: template}},
+		},
 	})
 
 	jobNames := func() []string {
@@ -174,20 +178,23 @@ func TestCronJobKeepsAFewFinishedJobs(t *testing.T) {
 	cc := &CronJobController{Client: c}
 
 	st.CronJobs.Create(api.CronJob{
-		Meta:        api.Meta{Name: "backup", Namespace: ns},
-		Schedule:    "0 0 1 1 *", // once a year, so it won't run during the test
-		JobTemplate: api.JobSpec{Template: busybox},
-		Status:      api.CronJobStatus{LastScheduleTime: time.Now()},
+		ObjectMeta: meta("backup"),
+		CronJobSpec: api.CronJobSpec{
+			Schedule:    "0 0 1 1 *", // once a year, so it won't run during the test
+			JobTemplate: api.JobTemplateSpec{Spec: api.JobSpec{Template: busybox}},
+		},
+		Status: api.CronJobStatus{LastScheduleTime: time.Now()},
 	})
 	for i, name := range []string{"j1", "j2", "j3", "j4", "j5"} {
-		st.Jobs.Create(api.Job{
-			Meta:  api.Meta{Name: name, Namespace: ns},
-			Owner: "backup",
+		job := api.Job{
+			ObjectMeta: meta(name),
 			Status: api.JobStatus{
 				Condition:      api.JobComplete,
 				CompletionTime: time.Now().Add(time.Duration(i) * time.Minute), // j5 is the newest
 			},
-		})
+		}
+		job.SetOwner("CronJob", "backup", "")
+		st.Jobs.Create(job)
 	}
 
 	cc.reconcileAll()
@@ -205,10 +212,10 @@ func TestDaemonSetRunsOnEveryReadyNode(t *testing.T) {
 	st, c := newTestCluster(t)
 	dc := &DaemonSetController{Client: c}
 
-	st.PutNode(api.Node{Name: "node-1", Ready: true})
-	st.PutNode(api.Node{Name: "node-2", Ready: true})
-	st.PutNode(api.Node{Name: "node-3", Ready: false})
-	st.DaemonSets.Create(api.DaemonSet{Meta: api.Meta{Name: "agent", Namespace: ns}, Template: busybox})
+	st.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-1"}, NodeStatus: api.NodeStatus{Ready: true}})
+	st.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-2"}, NodeStatus: api.NodeStatus{Ready: true}})
+	st.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-3"}, NodeStatus: api.NodeStatus{Ready: false}})
+	st.DaemonSets.Create(api.DaemonSet{ObjectMeta: meta("agent"), DaemonSetSpec: api.DaemonSetSpec{Template: busybox}})
 
 	dc.reconcileAll()
 	dc.reconcileAll() // a second check changes nothing
@@ -246,7 +253,7 @@ func TestStatefulSetCreatesPodsInOrder(t *testing.T) {
 	st, c := newTestCluster(t)
 	sc := &StatefulSetController{Client: c}
 
-	st.StatefulSets.Create(api.StatefulSet{Meta: api.Meta{Name: "db", Namespace: ns}, Replicas: 3, Template: busybox})
+	st.StatefulSets.Create(api.StatefulSet{ObjectMeta: meta("db"), StatefulSetSpec: api.StatefulSetSpec{Replicas: 3, Template: busybox}})
 
 	// One at a time, each only once the one before it is ready.
 	sc.reconcileAll()

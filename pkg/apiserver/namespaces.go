@@ -16,7 +16,7 @@ var validNamespace = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // handleListNamespaces returns all namespaces as JSON.
 func (s *server) handleListNamespaces(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.ListNamespaces())
+	writeList(w, r, s.store.ListNamespaces())
 }
 
 // handleCreateNamespace reads a namespace from the request body and stores it.
@@ -26,12 +26,17 @@ func (s *server) handleCreateNamespace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err := setKind(&ns.TypeMeta, "Namespace")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if !validNamespace.MatchString(ns.Name) {
 		http.Error(w, "namespace names use lowercase letters, digits and dashes, like \"team-a\"", http.StatusBadRequest)
 		return
 	}
 
-	err := s.store.CreateNamespace(ns)
+	ns, err = s.store.CreateNamespace(ns)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return

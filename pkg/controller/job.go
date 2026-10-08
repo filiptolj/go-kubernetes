@@ -13,23 +13,28 @@ import (
 // JobController runs the pods of every Job until enough of them have
 // succeeded, or too many have failed.
 type JobController struct {
-	Client *client.Client
-	Every  time.Duration // how often to check
+	Client    *client.Client
+	Informers *Informers    // where to read from; nil: from Client
+	Every     time.Duration // how often to check even if nothing seems to change
+
+	expected expectations // pods created or deleted but not seen yet, by Job
 }
 
-// Run checks the Jobs every jc.Every until ctx is cancelled.
+// Run checks the Jobs whenever a Job or a pod changes, and every jc.Every,
+// until ctx is cancelled.
 func (jc *JobController) Run(ctx context.Context) {
-	runEvery(ctx, jc.Every, jc.reconcileAll)
+	client.RunOnChange(ctx, "job controller", jc.Every, jc.reconcileAll, jc.Informers.jobs(), jc.Informers.pods())
 }
 
 // reconcileAll moves every Job forward, and removes pods whose Job is gone.
 func (jc *JobController) reconcileAll() {
-	jobs, err := jc.Client.Jobs().List("")
+	jc.expected.check() // before reading: see expectations.go
+	jobs, err := list(jc.Informers.jobs(), jc.Client.Jobs().List)
 	if err != nil {
 		log.Printf("job controller: %v", err)
 		return
 	}
-	pods, err := jc.Client.ListPods("")
+	pods, err := list(jc.Informers.pods(), jc.Client.ListPods)
 	if err != nil {
 		log.Printf("job controller: %v", err)
 		return
@@ -48,7 +53,7 @@ func (jc *JobController) reconcileAll() {
 			continue
 		}
 		for _, pod := range pods {
-			jc.deletePod(pod, fmt.Sprintf("its job %q is gone", pod.Owner))
+			jc.deletePod(pod, fmt.Sprintf("its job %q is gone", pod.OwnerName()))
 		}
 	}
 }
@@ -56,6 +61,10 @@ func (jc *JobController) reconcileAll() {
 // reconcile counts a Job's pods, decides whether it has finished, starts
 // more pods if it hasn't, and saves its status.
 func (jc *JobController) reconcile(job api.Job, pods []api.Pod) {
+	if !jc.expected.satisfied(api.Key(job.Namespace, job.Name)) {
+		return // the pods may not show our last changes yet
+	}
+
 	var active []api.Pod
 	succeeded, failed := 0, 0
 	for _, pod := range pods {
@@ -107,12 +116,13 @@ func (jc *JobController) reconcile(job api.Job, pods []api.Pod) {
 		// are still needed.
 		missing := min(job.Parallelism, job.Completions-succeeded) - len(active)
 		for range missing {
-			pod := newPod(newPodName(job.Name), job.Namespace, job.Template, "Job", job.Name)
+			pod := newPod(newPodName(job.Name), job.Template, "Job", job.ObjectMeta)
 			err := jc.Client.CreatePod(pod)
 			if err != nil {
 				log.Printf("job %s: %v", api.Key(job.Namespace, job.Name), err)
 				continue
 			}
+			expectPresent(&jc.expected, jc.Informers.pods(), api.Key(job.Namespace, job.Name), pod.Namespace, pod.Name)
 			status.Active++
 			jc.events().Normal("Job", job.Namespace, job.Name, "SuccessfulCreate", "created pod %q", pod.Name)
 		}
@@ -123,7 +133,9 @@ func (jc *JobController) reconcile(job api.Job, pods []api.Pod) {
 		err := jc.Client.Jobs().UpdateStatus(job.Namespace, job.Name, job)
 		if err != nil {
 			log.Printf("job controller: %v", err)
+			return
 		}
+		expectNewVersion(&jc.expected, jc.Informers.jobs(), api.Key(job.Namespace, job.Name), job.Namespace, job.Name, job.ResourceVersion)
 	}
 }
 
@@ -133,25 +145,11 @@ func (jc *JobController) deletePod(pod api.Pod, reason string) {
 		log.Printf("job controller: %v", err)
 		return
 	}
+	expectGone(&jc.expected, jc.Informers.pods(), api.Key(pod.Namespace, pod.OwnerName()), pod.Namespace, pod.Name)
 	log.Printf("deleted pod %s: %s", api.Key(pod.Namespace, pod.Name), reason)
 }
 
 // events returns the Job controller's event recorder.
 func (jc *JobController) events() *client.Recorder {
 	return jc.Client.Recorder("job-controller")
-}
-
-// runEvery calls fn every interval until ctx is cancelled.
-func runEvery(ctx context.Context, interval time.Duration, fn func()) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			fn()
-		}
-	}
 }

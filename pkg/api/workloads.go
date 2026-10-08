@@ -2,24 +2,77 @@ package api
 
 import "time"
 
-// Meta is the name and namespace of an object. The newer kinds of object
-// embed it, which puts its fields directly in the object (job.Name, not
-// job.Meta.Name), also in JSON.
-type Meta struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
+// PodTemplateSpec describes the pods a controller creates: their labels,
+// and what they run.
+type PodTemplateSpec struct {
+	ObjectMeta `json:"metadata"`
+	PodSpec    `json:"spec"`
+}
+
+// ReplicaSet keeps a fixed number of copies of a pod running.
+type ReplicaSet struct {
+	TypeMeta
+	ObjectMeta     `json:"metadata"`
+	ReplicaSetSpec `json:"spec"`
+}
+
+// ReplicaSetSpec is how many pods a ReplicaSet wants, and what they run.
+type ReplicaSetSpec struct {
+	Replicas int             `json:"replicas"`
+	Template PodTemplateSpec `json:"template"`
+}
+
+// Deployment keeps a number of pods running from a template, like a
+// ReplicaSet, but when the template changes it replaces the pods gradually:
+// a rolling update.
+type Deployment struct {
+	TypeMeta
+	ObjectMeta     `json:"metadata"`
+	DeploymentSpec `json:"spec"`
+}
+
+// DeploymentSpec is how many pods a Deployment wants, and what they run.
+type DeploymentSpec struct {
+	Replicas int             `json:"replicas"`
+	Template PodTemplateSpec `json:"template"`
+}
+
+// StatefulSet runs numbered copies of a pod with stable names: web-0, web-1,
+// web-2. They are created one at a time, in order, each only once the one
+// before is ready, and removed in reverse order. A replaced pod gets the same
+// name back. Databases and other apps that care which copy is which use it.
+type StatefulSet struct {
+	TypeMeta
+	ObjectMeta      `json:"metadata"`
+	StatefulSetSpec `json:"spec"`
+}
+
+// StatefulSetSpec is how many pods a StatefulSet wants, and what they run.
+type StatefulSetSpec struct {
+	Replicas int             `json:"replicas"`
+	Template PodTemplateSpec `json:"template"`
+}
+
+// DaemonSet runs one copy of a pod on every ready node, such as a log
+// collector or a monitoring agent.
+type DaemonSet struct {
+	TypeMeta
+	ObjectMeta    `json:"metadata"`
+	DaemonSetSpec `json:"spec"`
+}
+
+// DaemonSetSpec is what a DaemonSet's pods run.
+type DaemonSetSpec struct {
+	Template PodTemplateSpec `json:"template"`
 }
 
 // Job runs pods until a number of them have succeeded: for work that has an
 // end, such as a database migration or a report.
 type Job struct {
-	Meta
-	JobSpec
-
-	// Owner is the CronJob that created this Job, if any.
-	Owner string `json:"owner,omitempty"`
-
-	Status JobStatus `json:"status"`
+	TypeMeta
+	ObjectMeta `json:"metadata"`
+	JobSpec    `json:"spec"`
+	Status     JobStatus `json:"status"`
 }
 
 // JobSpec says what a Job runs, and how often it may try.
@@ -34,7 +87,7 @@ type JobSpec struct {
 
 	// Template is the pod to run. Its restart policy must be OnFailure or
 	// Never; the default is Never.
-	Template PodTemplate `json:"template"`
+	Template PodTemplateSpec `json:"template"`
 }
 
 // Conditions a Job finishes with.
@@ -58,8 +111,14 @@ type JobStatus struct {
 
 // CronJob creates a Job on a schedule, like cron on Linux.
 type CronJob struct {
-	Meta
+	TypeMeta
+	ObjectMeta  `json:"metadata"`
+	CronJobSpec `json:"spec"`
+	Status      CronJobStatus `json:"status"`
+}
 
+// CronJobSpec says when a CronJob runs, and what.
+type CronJobSpec struct {
 	// Schedule says when, in cron format: "minute hour day-of-month month
 	// day-of-week", such as "*/5 * * * *" for every five minutes.
 	Schedule string `json:"schedule"`
@@ -67,8 +126,12 @@ type CronJob struct {
 	// Suspend pauses the CronJob: no new Jobs are created while it is true.
 	Suspend bool `json:"suspend,omitempty"`
 
-	JobTemplate JobSpec       `json:"jobTemplate"`
-	Status      CronJobStatus `json:"status"`
+	JobTemplate JobTemplateSpec `json:"jobTemplate"`
+}
+
+// JobTemplateSpec describes the Jobs a CronJob creates.
+type JobTemplateSpec struct {
+	Spec JobSpec `json:"spec"`
 }
 
 // CronJobStatus is how a CronJob is doing.
@@ -77,34 +140,56 @@ type CronJobStatus struct {
 	LastScheduleTime time.Time `json:"lastScheduleTime,omitzero"`
 }
 
-// DaemonSet runs one copy of a pod on every ready node, such as a log
-// collector or a monitoring agent.
-type DaemonSet struct {
-	Meta
-	Template PodTemplate `json:"template"`
+// Service gives a group of pods one stable address. Connections to one of
+// its ports on the proxy are forwarded to the ready pods in the Service's
+// namespace whose labels match Selector. Ports are shared by the whole
+// cluster: two Services can't use the same one, even in different namespaces.
+type Service struct {
+	TypeMeta
+	ObjectMeta  `json:"metadata"`
+	ServiceSpec `json:"spec"`
 }
 
-// StatefulSet runs numbered copies of a pod with stable names: web-0, web-1,
-// web-2. They are created one at a time, in order, each only once the one
-// before is ready, and removed in reverse order. A replaced pod gets the same
-// name back. Databases and other apps that care which copy is which use it.
-type StatefulSet struct {
-	Meta
-	Replicas int         `json:"replicas"`
-	Template PodTemplate `json:"template"`
+// ServiceSpec is which pods a Service sends traffic to, and on which ports.
+type ServiceSpec struct {
+	Selector Labels        `json:"selector"`
+	Ports    []ServicePort `json:"ports"`
+}
+
+// ServicePort is one port of a Service: connections to Port go to TargetPort
+// on the pods. TargetPort defaults to Port.
+type ServicePort struct {
+	Name       string `json:"name,omitempty"`
+	Port       int    `json:"port"`
+	TargetPort int    `json:"targetPort,omitempty"`
+}
+
+// Target returns the pod port a ServicePort sends traffic to.
+func (p ServicePort) Target() int {
+	if p.TargetPort == 0 {
+		return p.Port
+	}
+	return p.TargetPort
 }
 
 // ConfigMap holds settings for pods: as environment variables, or as files
 // in a volume.
 type ConfigMap struct {
-	Meta
-	Data map[string]string `json:"data"`
+	TypeMeta
+	ObjectMeta `json:"metadata"`
+	Data       map[string]string `json:"data"`
 }
 
-// Secret is like a ConfigMap, for passwords and keys. minikubectl never
-// prints its values, and its files and environment are only readable by
-// their owner. Note that, as stored, it is not encrypted.
+// Secret is like a ConfigMap, for passwords and keys.
+//
+// Its values are bytes. In JSON, Go writes a []byte as base64 text, which
+// is exactly how Kubernetes shows Secrets: "cGFzc3dvcmQ=". To write a
+// Secret by hand, put plain text in StringData instead; the API server moves
+// it into Data. Note that base64 is not encryption: anyone who can read the
+// Secret can decode it.
 type Secret struct {
-	Meta
-	Data map[string]string `json:"data"`
+	TypeMeta
+	ObjectMeta `json:"metadata"`
+	Data       map[string][]byte `json:"data,omitempty"`
+	StringData map[string]string `json:"stringData,omitempty"`
 }

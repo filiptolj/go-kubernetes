@@ -15,11 +15,11 @@ import (
 	"github.com/filiptolj/go-kubernetes/pkg/store"
 )
 
-// fakePod starts a web server that answers with the pod's name, and returns
-// its host:port.
 // ns is the namespace the tests use.
 const ns = api.DefaultNamespace
 
+// fakePod starts a web server that answers with the pod's name, and returns
+// its host:port.
 func fakePod(t *testing.T, name string) string {
 	t.Helper()
 
@@ -28,6 +28,15 @@ func fakePod(t *testing.T, name string) string {
 	}))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// pod returns a pod in namespace whose container port 80 is published at
+// the address of a fake web server.
+func pod(t *testing.T, namespace, name string, labels api.Labels, phase api.PodPhase, ready bool) api.Pod {
+	return api.Pod{
+		ObjectMeta: api.ObjectMeta{Name: name, Namespace: namespace, Labels: labels},
+		PodStatus:  api.PodStatus{Phase: phase, Ready: ready, HostPorts: map[int]string{80: fakePod(t, name)}},
+	}
 }
 
 // freePort returns a TCP port nobody is using.
@@ -71,16 +80,19 @@ func TestProxy(t *testing.T) {
 
 	// Two web pods, one pod of another app, and one web pod that isn't running.
 	web := api.Labels{"app": "web"}
-	st.CreatePod(api.Pod{Namespace: ns, Name: "web-a", Labels: web, Phase: api.PodRunning, Ready: true, Address: fakePod(t, "web-a")})
-	st.CreatePod(api.Pod{Namespace: ns, Name: "web-b", Labels: web, Phase: api.PodRunning, Ready: true, Address: fakePod(t, "web-b")})
-	st.CreatePod(api.Pod{Namespace: ns, Name: "db", Labels: api.Labels{"app": "db"}, Phase: api.PodRunning, Ready: true, Address: fakePod(t, "db")})
-	st.CreatePod(api.Pod{Namespace: ns, Name: "web-pending", Labels: web, Phase: api.PodPending, Address: fakePod(t, "web-pending")})
-	st.CreatePod(api.Pod{Namespace: ns, Name: "web-starting", Labels: web, Phase: api.PodRunning, Ready: false, Address: fakePod(t, "web-starting")})
-	st.CreateNamespace(api.Namespace{Name: "other"})
-	st.CreatePod(api.Pod{Namespace: "other", Name: "web-elsewhere", Labels: web, Phase: api.PodRunning, Ready: true, Address: fakePod(t, "web-elsewhere")})
+	st.CreatePod(pod(t, ns, "web-a", web, api.PodRunning, true))
+	st.CreatePod(pod(t, ns, "web-b", web, api.PodRunning, true))
+	st.CreatePod(pod(t, ns, "db", api.Labels{"app": "db"}, api.PodRunning, true))
+	st.CreatePod(pod(t, ns, "web-pending", web, api.PodPending, false))
+	st.CreatePod(pod(t, ns, "web-starting", web, api.PodRunning, false))
+	st.CreateNamespace(api.Namespace{ObjectMeta: api.ObjectMeta{Name: "other"}})
+	st.CreatePod(pod(t, "other", "web-elsewhere", web, api.PodRunning, true))
 
 	port := freePort(t)
-	st.CreateService(api.Service{Namespace: ns, Name: "web", Port: port, Selector: web})
+	st.CreateService(api.Service{
+		ObjectMeta:  api.ObjectMeta{Name: "web", Namespace: ns},
+		ServiceSpec: api.ServiceSpec{Selector: web, Ports: []api.ServicePort{{Port: port, TargetPort: 80}}},
+	})
 	p.sync()
 
 	// Connections take turns between the two ready web pods, and never reach

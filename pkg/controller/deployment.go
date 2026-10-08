@@ -20,41 +20,37 @@ import (
 // During a rolling update there are never more than Replicas+1 pods, and
 // never fewer than Replicas running and ready, so the app stays fully available.
 type DeploymentController struct {
-	Client *client.Client
-	Every  time.Duration // how often to check
+	Client    *client.Client
+	Informers *Informers    // where to read from; nil: from Client
+	Every     time.Duration // how often to check even if nothing seems to change
+
+	expected expectations // changes to ReplicaSets not seen yet, by Deployment
 }
 
-// Run reconciles every Deployment every dc.Every until ctx is cancelled.
+// Run reconciles every Deployment whenever a Deployment, a ReplicaSet or a
+// pod changes, and every dc.Every, until ctx is cancelled.
 func (dc *DeploymentController) Run(ctx context.Context) {
-	ticker := time.NewTicker(dc.Every)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			dc.reconcileAll()
-		}
-	}
+	client.RunOnChange(ctx, "deployment controller", dc.Every, dc.reconcileAll,
+		dc.Informers.deployments(), dc.Informers.replicaSets(), dc.Informers.pods())
 }
 
 // reconcileAll moves every Deployment one step closer to how it should be,
 // and removes ReplicaSets whose Deployment no longer exists.
 func (dc *DeploymentController) reconcileAll() {
-	deployments, err := dc.Client.ListDeployments("") // every namespace
+	dc.expected.check() // before reading: see expectations.go
+	deployments, err := list(dc.Informers.deployments(), dc.Client.ListDeployments)
 	if err != nil {
 		log.Printf("deployment controller: %v", err)
 		return
 	}
 
-	sets, err := dc.Client.ListReplicaSets("")
+	sets, err := list(dc.Informers.replicaSets(), dc.Client.ListReplicaSets)
 	if err != nil {
 		log.Printf("deployment controller: %v", err)
 		return
 	}
 
-	pods, err := dc.Client.ListPods("")
+	pods, err := list(dc.Informers.pods(), dc.Client.ListPods)
 	if err != nil {
 		log.Printf("deployment controller: %v", err)
 		return
@@ -68,7 +64,7 @@ func (dc *DeploymentController) reconcileAll() {
 		if !pod.ControlledBy("ReplicaSet") {
 			continue
 		}
-		owner := api.Key(pod.Namespace, pod.Owner)
+		owner := api.Key(pod.Namespace, pod.OwnerName())
 		if isAlive(pod) {
 			alive[owner]++
 		}
@@ -80,8 +76,8 @@ func (dc *DeploymentController) reconcileAll() {
 	// ReplicaSets, grouped by the "namespace/name" of their Deployment.
 	owned := make(map[string][]api.ReplicaSet)
 	for _, rs := range sets {
-		if rs.Owner != "" {
-			owner := api.Key(rs.Namespace, rs.Owner)
+		if rs.ControlledBy("Deployment") {
+			owner := api.Key(rs.Namespace, rs.OwnerName())
 			owned[owner] = append(owned[owner], rs)
 		}
 	}
@@ -98,7 +94,7 @@ func (dc *DeploymentController) reconcileAll() {
 			continue
 		}
 		for _, rs := range sets {
-			dc.deleteReplicaSet(rs, fmt.Sprintf("its deployment %q is gone", rs.Owner))
+			dc.deleteReplicaSet(rs, fmt.Sprintf("its deployment %q is gone", rs.OwnerName()))
 		}
 	}
 }
@@ -107,6 +103,10 @@ func (dc *DeploymentController) reconcileAll() {
 // Taking one small step per check is what makes the update gradual. alive and
 // running count pods per ReplicaSet, by the ReplicaSet's "namespace/name".
 func (dc *DeploymentController) reconcile(d api.Deployment, sets []api.ReplicaSet, alive, running map[string]int) {
+	if !dc.expected.satisfied(api.Key(d.Namespace, d.Name)) {
+		return // the ReplicaSets may not show our last step yet
+	}
+
 	// count returns the pods of a ReplicaSet in one of the maps above.
 	count := func(m map[string]int, rs api.ReplicaSet) int {
 		return m[api.Key(rs.Namespace, rs.Name)]
@@ -133,7 +133,13 @@ func (dc *DeploymentController) reconcile(d api.Deployment, sets []api.ReplicaSe
 			log.Printf("deployment %q: template changed, starting rolling update to %s", d.Name, newName)
 			dc.events().Normal("Deployment", d.Namespace, d.Name, "RollingUpdate", "template changed, rolling out replicaset %q", newName)
 		}
-		dc.createReplicaSet(api.ReplicaSet{Name: newName, Namespace: d.Namespace, Replicas: replicas, Template: d.Template, Owner: d.Name})
+		rs := api.ReplicaSet{
+			TypeMeta:       api.TypeMetaFor("ReplicaSet"),
+			ObjectMeta:     api.ObjectMeta{Name: newName, Namespace: d.Namespace},
+			ReplicaSetSpec: api.ReplicaSetSpec{Replicas: replicas, Template: d.Template},
+		}
+		rs.SetOwner("Deployment", d.Name, d.UID)
+		dc.createReplicaSet(rs)
 		return
 	}
 
@@ -188,7 +194,7 @@ func (dc *DeploymentController) reconcile(d api.Deployment, sets []api.ReplicaSe
 
 // templateHash returns a short fingerprint of a pod template. Identical
 // templates always get the same hash; any change gives a different one.
-func templateHash(t api.PodTemplate) string {
+func templateHash(t api.PodTemplateSpec) string {
 	data, _ := json.Marshal(t)
 
 	h := fnv.New32a()
@@ -207,8 +213,9 @@ func (dc *DeploymentController) createReplicaSet(rs api.ReplicaSet) {
 		log.Printf("deployment controller: %v", err)
 		return
 	}
-	log.Printf("deployment %s: created replicaset %q (%d replicas)", api.Key(rs.Namespace, rs.Owner), rs.Name, rs.Replicas)
-	dc.events().Normal("Deployment", rs.Namespace, rs.Owner, "ScalingReplicaSet", "created replicaset %q with %d replicas", rs.Name, rs.Replicas)
+	expectPresent(&dc.expected, dc.Informers.replicaSets(), api.Key(rs.Namespace, rs.OwnerName()), rs.Namespace, rs.Name)
+	log.Printf("deployment %s: created replicaset %q (%d replicas)", api.Key(rs.Namespace, rs.OwnerName()), rs.Name, rs.Replicas)
+	dc.events().Normal("Deployment", rs.Namespace, rs.OwnerName(), "ScalingReplicaSet", "created replicaset %q with %d replicas", rs.Name, rs.Replicas)
 }
 
 func (dc *DeploymentController) scale(rs api.ReplicaSet, replicas int) {
@@ -217,8 +224,9 @@ func (dc *DeploymentController) scale(rs api.ReplicaSet, replicas int) {
 		log.Printf("deployment controller: %v", err)
 		return
 	}
-	log.Printf("deployment %s: scaled replicaset %q from %d to %d", api.Key(rs.Namespace, rs.Owner), rs.Name, rs.Replicas, replicas)
-	dc.events().Normal("Deployment", rs.Namespace, rs.Owner, "ScalingReplicaSet", "scaled replicaset %q from %d to %d", rs.Name, rs.Replicas, replicas)
+	expectNewVersion(&dc.expected, dc.Informers.replicaSets(), api.Key(rs.Namespace, rs.OwnerName()), rs.Namespace, rs.Name, rs.ResourceVersion)
+	log.Printf("deployment %s: scaled replicaset %q from %d to %d", api.Key(rs.Namespace, rs.OwnerName()), rs.Name, rs.Replicas, replicas)
+	dc.events().Normal("Deployment", rs.Namespace, rs.OwnerName(), "ScalingReplicaSet", "scaled replicaset %q from %d to %d", rs.Name, rs.Replicas, replicas)
 }
 
 func (dc *DeploymentController) deleteReplicaSet(rs api.ReplicaSet, reason string) {
@@ -227,6 +235,7 @@ func (dc *DeploymentController) deleteReplicaSet(rs api.ReplicaSet, reason strin
 		log.Printf("deployment controller: %v", err)
 		return
 	}
+	expectGone(&dc.expected, dc.Informers.replicaSets(), api.Key(rs.Namespace, rs.OwnerName()), rs.Namespace, rs.Name)
 	log.Printf("deleted replicaset %s: %s", api.Key(rs.Namespace, rs.Name), reason)
-	dc.events().Normal("Deployment", rs.Namespace, rs.Owner, "DeletedReplicaSet", "deleted replicaset %q: %s", rs.Name, reason)
+	dc.events().Normal("Deployment", rs.Namespace, rs.OwnerName(), "DeletedReplicaSet", "deleted replicaset %q: %s", rs.Name, reason)
 }

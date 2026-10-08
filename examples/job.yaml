@@ -1,0 +1,13 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: countdown
+spec:
+  completions: 3
+  parallelism: 2
+  template:
+    spec:
+      containers:
+      - name: main
+        image: busybox:1.36
+        command: ["sh", "-c", "echo $POD_NAME counting down; for i in 3 2 1; do echo $i; sleep 1; done; echo done"]

@@ -18,16 +18,16 @@ func testBackend(t *testing.T, open func() Backend) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	first.PutNode(api.Node{Name: "node-1", Ready: true})
-	first.CreatePod(api.Pod{Namespace: ns, Name: "nginx"})
+	first.PutNode(api.Node{ObjectMeta: meta("node-1"), NodeStatus: api.NodeStatus{Ready: true}})
+	first.CreatePod(api.Pod{ObjectMeta: meta("nginx")})
 	first.BindPod(ns, "nginx", "node-1")
-	first.CreatePod(api.Pod{Namespace: ns, Name: "gone"})
+	first.CreatePod(api.Pod{ObjectMeta: meta("gone")})
 	first.DeletePod(ns, "gone")
-	first.CreateReplicaSet(api.ReplicaSet{Namespace: ns, Name: "web", Replicas: 3})
-	first.CreateDeployment(api.Deployment{Namespace: ns, Name: "app", Replicas: 2})
-	first.CreateService(api.Service{Namespace: ns, Name: "svc", Port: 8081, Selector: api.Labels{"app": "web"}})
-	first.Jobs.Create(api.Job{Meta: api.Meta{Name: "report", Namespace: ns}, JobSpec: api.JobSpec{Completions: 2}})
-	first.ConfigMaps.Create(api.ConfigMap{Meta: api.Meta{Name: "settings", Namespace: ns}, Data: map[string]string{"mode": "fast"}})
+	first.CreateReplicaSet(api.ReplicaSet{ObjectMeta: meta("web"), ReplicaSetSpec: api.ReplicaSetSpec{Replicas: 3}})
+	first.CreateDeployment(api.Deployment{ObjectMeta: meta("app"), DeploymentSpec: api.DeploymentSpec{Replicas: 2}})
+	first.CreateService(service("svc", 8081, api.Labels{"app": "web"}, ns))
+	first.Jobs.Create(api.Job{ObjectMeta: meta("report"), JobSpec: api.JobSpec{Completions: 2}})
+	first.ConfigMaps.Create(api.ConfigMap{ObjectMeta: meta("settings"), Data: map[string]string{"mode": "fast"}})
 	first.Close()
 
 	second, err := Open(open())
@@ -118,7 +118,7 @@ type brokenBackend struct{}
 // has nothing to write and only the test's own change hits the failure.
 func (brokenBackend) LoadAll() (map[string]map[string][]byte, error) {
 	return map[string]map[string][]byte{
-		kindNamespaces: {api.DefaultNamespace: []byte(`{"name":"default"}`)},
+		kindNamespaces: {api.DefaultNamespace: []byte(`{"metadata":{"name":"default"}}`)},
 	}, nil
 }
 func (brokenBackend) Put(kind, name string, data []byte) error { return errors.New("disk on fire") }
@@ -131,7 +131,7 @@ func TestBackendFailureRefusesTheChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = s.CreatePod(api.Pod{Namespace: ns, Name: "nginx"})
+	_, err = s.CreatePod(api.Pod{ObjectMeta: meta("nginx")})
 	if err == nil {
 		t.Fatal("CreatePod succeeded although the backend couldn't save it")
 	}

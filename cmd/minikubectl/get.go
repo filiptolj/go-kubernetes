@@ -92,7 +92,7 @@ func (c *cli) getPods(watch bool) error {
 		return err
 	}
 	for event := range events {
-		pod := event.Pod
+		pod := event.Object
 		if !c.all && pod.Namespace != c.namespace {
 			continue
 		}
@@ -129,7 +129,7 @@ func (c *cli) getNodes() error {
 		if !node.LastHeartbeat.IsZero() {
 			heartbeat = time.Since(node.LastHeartbeat).Round(time.Second).String() + " ago"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%d\t%dMi\t%s\n", node.Name, status, node.CPU, node.Memory, heartbeat)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", node.Name, status, orNone(node.Capacity["cpu"]), orNone(node.Capacity["memory"]), heartbeat)
 	}
 	return w.Flush()
 }
@@ -168,7 +168,7 @@ func (c *cli) getReplicaSets() error {
 		if !pod.ControlledBy("ReplicaSet") {
 			continue
 		}
-		owner := api.Key(pod.Namespace, pod.Owner)
+		owner := api.Key(pod.Namespace, pod.OwnerName())
 		switch pod.Phase {
 		case api.PodPending:
 			current[owner]++
@@ -181,7 +181,7 @@ func (c *cli) getReplicaSets() error {
 	w := c.newTable("NAME\tDESIRED\tCURRENT\tRUNNING\tOWNER")
 	for _, rs := range sets {
 		key := api.Key(rs.Namespace, rs.Name)
-		c.row(w, rs.Namespace, rs.Name, rs.Replicas, current[key], running[key], orNone(rs.Owner))
+		c.row(w, rs.Namespace, rs.Name, rs.Replicas, current[key], running[key], orNone(rs.OwnerName()))
 	}
 	return w.Flush()
 }
@@ -231,7 +231,7 @@ func readyByOwner(pods []api.Pod) map[string]int {
 	ready := make(map[string]int)
 	for _, pod := range pods {
 		if pod.ControlledBy("ReplicaSet") && pod.Phase == api.PodRunning && pod.Ready {
-			ready[api.Key(pod.Namespace, pod.Owner)]++
+			ready[api.Key(pod.Namespace, pod.OwnerName())]++
 		}
 	}
 	return ready
@@ -241,7 +241,7 @@ func readyByOwner(pods []api.Pod) map[string]int {
 func ownedBy(d api.Deployment, sets []api.ReplicaSet) []api.ReplicaSet {
 	var owned []api.ReplicaSet
 	for _, rs := range sets {
-		if rs.Namespace == d.Namespace && rs.Owner == d.Name {
+		if rs.Namespace == d.Namespace && rs.OwnedBy("Deployment", d.Name) {
 			owned = append(owned, rs)
 		}
 	}
@@ -260,9 +260,9 @@ func newestReplicaSet(d api.Deployment, sets []api.ReplicaSet) string {
 }
 
 // sameTemplate reports whether two pod templates run the same containers.
-func sameTemplate(a, b api.PodTemplate) bool {
+func sameTemplate(a, b api.PodTemplateSpec) bool {
 	return slices.EqualFunc(a.Containers, b.Containers, func(x, y api.Container) bool {
-		return x.Name == y.Name && x.Image == y.Image && x.Port == y.Port && slices.Equal(x.Command, y.Command)
+		return x.Name == y.Name && x.Image == y.Image && slices.Equal(x.Ports, y.Ports) && slices.Equal(x.Command, y.Command)
 	})
 }
 
@@ -278,7 +278,7 @@ func (c *cli) getServices() error {
 		return err
 	}
 
-	w := c.newTable("NAME\tPORT\tSELECTOR\tPODS")
+	w := c.newTable("NAME\tPORTS\tSELECTOR\tPODS")
 	for _, svc := range services {
 		endpoints := 0
 		for _, pod := range pods {
@@ -286,7 +286,7 @@ func (c *cli) getServices() error {
 				endpoints++
 			}
 		}
-		c.row(w, svc.Namespace, svc.Name, svc.Port, formatLabels(svc.Selector), endpoints)
+		c.row(w, svc.Namespace, svc.Name, servicePorts(svc), formatLabels(svc.Selector), endpoints)
 	}
 	return w.Flush()
 }

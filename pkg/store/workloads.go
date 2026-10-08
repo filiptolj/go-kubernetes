@@ -8,27 +8,28 @@ import (
 
 // CreateDeployment saves a new Deployment. It fails if one with that name
 // already exists in its namespace.
-func (s *Store) CreateDeployment(d api.Deployment) error {
+func (s *Store) CreateDeployment(d api.Deployment) (api.Deployment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	err := s.checkNamespace(d.Namespace)
 	if err != nil {
-		return err
+		return api.Deployment{}, err
 	}
 
 	key := api.Key(d.Namespace, d.Name)
 	_, exists := s.deployments[key]
 	if exists {
-		return fmt.Errorf("deployment %q already exists in namespace %q: %w", d.Name, d.Namespace, ErrConflict)
+		return api.Deployment{}, fmt.Errorf("deployment %q already exists in namespace %q: %w", d.Name, d.Namespace, ErrConflict)
 	}
 
-	err = s.put(kindDeployments, key, d)
+	s.stampNew(&d.ObjectMeta)
+	err = s.put(api.EventAdded, kindDeployments, key, d)
 	if err != nil {
-		return err
+		return api.Deployment{}, err
 	}
 	s.deployments[key] = d
-	return nil
+	return d, nil
 }
 
 // UpdateDeployment replaces an existing Deployment. Changing its template
@@ -38,12 +39,16 @@ func (s *Store) UpdateDeployment(d api.Deployment) error {
 	defer s.mu.Unlock()
 
 	key := api.Key(d.Namespace, d.Name)
-	_, ok := s.deployments[key]
+	stored, ok := s.deployments[key]
 	if !ok {
 		return fmt.Errorf("deployment %q in namespace %q: %w", d.Name, d.Namespace, ErrNotFound)
 	}
 
-	err := s.put(kindDeployments, key, d)
+	err := s.stampUpdate(&d.ObjectMeta, stored.ObjectMeta)
+	if err != nil {
+		return fmt.Errorf("deployment %q: %w", d.Name, err)
+	}
+	err = s.put(api.EventModified, kindDeployments, key, d)
 	if err != nil {
 		return err
 	}
@@ -72,7 +77,7 @@ func (s *Store) DeleteDeployment(namespace, name string) error {
 		return fmt.Errorf("deployment %q in namespace %q: %w", name, namespace, ErrNotFound)
 	}
 
-	err := s.remove(kindDeployments, key)
+	err := s.remove(kindDeployments, key, s.deployments[key])
 	if err != nil {
 		return err
 	}
@@ -92,7 +97,8 @@ func (s *Store) ScaleDeployment(namespace, name string, replicas int) (api.Deplo
 	}
 
 	d.Replicas = replicas
-	err := s.put(kindDeployments, key, d)
+	d.ResourceVersion = s.nextVersion()
+	err := s.put(api.EventModified, kindDeployments, key, d)
 	if err != nil {
 		return api.Deployment{}, err
 	}
@@ -103,33 +109,38 @@ func (s *Store) ScaleDeployment(namespace, name string, replicas int) (api.Deplo
 // CreateService saves a new Service. It fails if one with that name already
 // exists in its namespace, or if any Service, in any namespace, already uses
 // its port: the proxy listens on one port per Service for the whole cluster.
-func (s *Store) CreateService(svc api.Service) error {
+func (s *Store) CreateService(svc api.Service) (api.Service, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	err := s.checkNamespace(svc.Namespace)
 	if err != nil {
-		return err
+		return api.Service{}, err
 	}
 
 	key := api.Key(svc.Namespace, svc.Name)
 	_, exists := s.services[key]
 	if exists {
-		return fmt.Errorf("service %q already exists in namespace %q: %w", svc.Name, svc.Namespace, ErrConflict)
+		return api.Service{}, fmt.Errorf("service %q already exists in namespace %q: %w", svc.Name, svc.Namespace, ErrConflict)
 	}
 	for _, other := range s.services {
-		if other.Port == svc.Port {
-			return fmt.Errorf("port %d is already used by service %q in namespace %q: %w",
-				svc.Port, other.Name, other.Namespace, ErrConflict)
+		for _, theirs := range other.Ports {
+			for _, ours := range svc.Ports {
+				if theirs.Port == ours.Port {
+					return api.Service{}, fmt.Errorf("port %d is already used by service %q in namespace %q: %w",
+						ours.Port, other.Name, other.Namespace, ErrConflict)
+				}
+			}
 		}
 	}
 
-	err = s.put(kindServices, key, svc)
+	s.stampNew(&svc.ObjectMeta)
+	err = s.put(api.EventAdded, kindServices, key, svc)
 	if err != nil {
-		return err
+		return api.Service{}, err
 	}
 	s.services[key] = svc
-	return nil
+	return svc, nil
 }
 
 // ListServices returns the Services in a namespace, or in all namespaces if
@@ -152,7 +163,7 @@ func (s *Store) DeleteService(namespace, name string) error {
 		return fmt.Errorf("service %q in namespace %q: %w", name, namespace, ErrNotFound)
 	}
 
-	err := s.remove(kindServices, key)
+	err := s.remove(kindServices, key, s.services[key])
 	if err != nil {
 		return err
 	}

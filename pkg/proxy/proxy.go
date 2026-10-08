@@ -21,16 +21,21 @@ import (
 // Proxy forwards connections for every Service.
 type Proxy struct {
 	Client   *client.Client
-	Every    time.Duration // how often to look for new Services and pods
+	Every    time.Duration // how often to look again even if nothing changed
 	BindAddr string        // where to listen, such as "127.0.0.1"
 
+	// Where to read Services and pods. If nil, the proxy asks the API server.
+	Services *client.Informer[api.Service]
+	Pods     *client.Informer[api.Pod]
+
 	mu       sync.Mutex
-	services map[string]*service // by the Service's "namespace/name"
+	services map[string]*service // by "namespace/name:port"
 }
 
-// service is one Service the proxy listens for.
+// service is one port of a Service, which the proxy listens on.
 type service struct {
 	svc       api.Service
+	port      api.ServicePort
 	listener  net.Listener
 	endpoints []endpoint // the pods to forward to; guarded by Proxy.mu
 	next      int        // which endpoint gets the next connection
@@ -42,34 +47,30 @@ type endpoint struct {
 	Address string
 }
 
-// Run keeps the proxy in sync with the Services and pods every p.Every,
-// until ctx is cancelled. Then it stops listening.
+// Run keeps the proxy in sync with the Services and pods, whenever they
+// change, until ctx is cancelled. Then it stops listening.
 func (p *Proxy) Run(ctx context.Context) {
-	ticker := time.NewTicker(p.Every)
-	defer ticker.Stop()
+	client.RunOnChange(ctx, "proxy", p.Every, p.sync, p.Services, p.Pods)
+	p.closeAll()
+}
 
-	p.sync()
-	for {
-		select {
-		case <-ctx.Done():
-			p.closeAll()
-			return
-		case <-ticker.C:
-			p.sync()
-		}
+// list returns every Service and every pod.
+func (p *Proxy) list() ([]api.Service, []api.Pod, error) {
+	if p.Services != nil && p.Pods != nil {
+		return p.Services.List(""), p.Pods.List(""), nil
 	}
+	services, err := p.Client.ListServices("") // every namespace
+	if err != nil {
+		return nil, nil, err
+	}
+	pods, err := p.Client.ListPods("")
+	return services, pods, err
 }
 
 // sync starts listening for new Services, stops for deleted ones, and
 // refreshes the pods each Service forwards to.
 func (p *Proxy) sync() {
-	services, err := p.Client.ListServices("") // every namespace
-	if err != nil {
-		log.Printf("proxy: %v", err)
-		return
-	}
-
-	pods, err := p.Client.ListPods("")
+	services, pods, err := p.list()
 	if err != nil {
 		log.Printf("proxy: %v", err)
 		return
@@ -84,31 +85,29 @@ func (p *Proxy) sync() {
 
 	wanted := make(map[string]bool)
 	for _, svc := range services {
-		key := api.Key(svc.Namespace, svc.Name)
-		wanted[key] = true
+		for _, port := range svc.Ports {
+			key := fmt.Sprintf("%s:%d", api.Key(svc.Namespace, svc.Name), port.Port)
+			wanted[key] = true
 
-		s, ok := p.services[key]
-		if ok && s.svc.Port != svc.Port {
-			s.listener.Close() // the port changed: listen again below
-			ok = false
-		}
-		if !ok {
-			l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", p.BindAddr, svc.Port))
-			if err != nil {
-				log.Printf("proxy: service %s: %v", key, err)
-				continue
+			s, ok := p.services[key]
+			if !ok {
+				l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", p.BindAddr, port.Port))
+				if err != nil {
+					log.Printf("proxy: service %s: %v", key, err)
+					continue
+				}
+				s = &service{svc: svc, port: port, listener: l}
+				p.services[key] = s
+				go p.serve(s)
+				log.Printf("service %s: listening on %s", key, l.Addr())
 			}
-			s = &service{svc: svc, listener: l}
-			p.services[key] = s
-			go p.serve(s)
-			log.Printf("service %s: listening on %s", key, l.Addr())
-		}
-		s.svc = svc
+			s.svc, s.port = svc, port
 
-		endpoints := endpointsFor(svc, pods)
-		if !slices.Equal(endpoints, s.endpoints) {
-			log.Printf("service %s: %d pods to forward to", key, len(endpoints))
-			s.endpoints = endpoints
+			endpoints := endpointsFor(svc, port, pods)
+			if !slices.Equal(endpoints, s.endpoints) {
+				log.Printf("service %s: %d pods to forward to", key, len(endpoints))
+				s.endpoints = endpoints
+			}
 		}
 	}
 
@@ -121,14 +120,18 @@ func (p *Proxy) sync() {
 	}
 }
 
-// endpointsFor returns the ready pods a Service selects: in its own
-// namespace, with matching labels.
-func endpointsFor(svc api.Service, pods []api.Pod) []endpoint {
+// endpointsFor returns where to send connections to one port of a Service:
+// the target port of every ready pod it selects, in its own namespace, with
+// matching labels.
+func endpointsFor(svc api.Service, port api.ServicePort, pods []api.Pod) []endpoint {
 	var endpoints []endpoint
 	for _, pod := range pods {
-		if pod.Namespace == svc.Namespace && pod.Phase == api.PodRunning && pod.Ready &&
-			pod.Address != "" && pod.Labels.Matches(svc.Selector) {
-			endpoints = append(endpoints, endpoint{Pod: pod.Name, Address: pod.Address})
+		if pod.Namespace != svc.Namespace || pod.Phase != api.PodRunning || !pod.Ready || !pod.Labels.Matches(svc.Selector) {
+			continue
+		}
+		address := pod.HostPorts[port.Target()]
+		if address != "" {
+			endpoints = append(endpoints, endpoint{Pod: pod.Name, Address: address})
 		}
 	}
 	return endpoints
@@ -152,18 +155,18 @@ func (p *Proxy) forward(s *service, conn net.Conn) {
 
 	ep, ok := p.pick(s)
 	if !ok {
-		log.Printf("service %s: no ready pods to forward to", api.Key(s.svc.Namespace, s.svc.Name))
+		log.Printf("service %s: no ready pods to forward to", fmt.Sprintf("%s:%d", api.Key(s.svc.Namespace, s.svc.Name), s.port.Port))
 		return
 	}
 
 	backend, err := net.DialTimeout("tcp", ep.Address, 3*time.Second)
 	if err != nil {
-		log.Printf("service %s: pod %q: %v", api.Key(s.svc.Namespace, s.svc.Name), ep.Pod, err)
+		log.Printf("service %s: pod %q: %v", fmt.Sprintf("%s:%d", api.Key(s.svc.Namespace, s.svc.Name), s.port.Port), ep.Pod, err)
 		return
 	}
 	defer backend.Close()
 
-	log.Printf("service %s: connection from %s -> pod %q", api.Key(s.svc.Namespace, s.svc.Name), conn.RemoteAddr(), ep.Pod)
+	log.Printf("service %s: connection from %s -> pod %q", fmt.Sprintf("%s:%d", api.Key(s.svc.Namespace, s.svc.Name), s.port.Port), conn.RemoteAddr(), ep.Pod)
 
 	// Copy in both directions at the same time. When one direction ends,
 	// returning closes both connections, which ends the other copy too.

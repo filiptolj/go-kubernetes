@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Node
+metadata:
+  name: node-2
+status:
+  capacity:
+    cpu: "2"
+    memory: 4096Mi
+  ready: true

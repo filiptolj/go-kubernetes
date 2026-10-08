@@ -5,40 +5,117 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 	"github.com/filiptolj/go-kubernetes/pkg/client"
 )
 
-// applyFile reads an object from a JSON file and creates it on the API
-// server. The file's "kind" field says what it is. An object that lives in a
-// namespace goes in the namespace the file names, or else the one from -n.
+// applyPath applies a manifest file, or every manifest (.yaml, .yml or
+// .json) in a folder.
+func (c *cli) applyPath(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return c.applyFile(path)
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		ext := filepath.Ext(entry.Name())
+		if entry.IsDir() || (ext != ".yaml" && ext != ".yml" && ext != ".json") {
+			continue
+		}
+		err := c.applyFile(filepath.Join(path, entry.Name()))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyFile applies every object in a manifest file. The file is YAML or
+// JSON, and may hold several objects separated by lines of "---".
 func (c *cli) applyFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 
-	var header struct {
-		Kind      string `json:"kind"`
-		Namespace string `json:"namespace"`
+	for i, doc := range splitDocuments(data) {
+		// YAMLToJSON turns YAML into JSON, so the JSON tags on our types
+		// work for both. JSON is valid YAML, so .json files go through too.
+		jsonData, err := yaml.YAMLToJSON(doc)
+		if err != nil {
+			return fmt.Errorf("%s, object %d: %w", path, i+1, err)
+		}
+		err = c.applyObject(jsonData)
+		if err != nil {
+			return fmt.Errorf("%s, object %d: %w", path, i+1, err)
+		}
 	}
-	err = json.Unmarshal(data, &header)
-	if err != nil {
-		return fmt.Errorf("parse %s: %w", path, err)
+	return nil
+}
+
+// splitDocuments splits a YAML file at lines of "---", dropping documents
+// that are empty or only hold comments.
+func splitDocuments(data []byte) [][]byte {
+	var docs [][]byte
+	var current []string
+	flush := func() {
+		text := strings.Join(current, "\n")
+		for _, line := range current {
+			trimmed := strings.TrimSpace(line)
+			if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				docs = append(docs, []byte(text))
+				break
+			}
+		}
+		current = nil
 	}
 
-	namespace, err := c.namespaceFor(header.Namespace)
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimRight(line, " \r") == "---" {
+			flush()
+			continue
+		}
+		current = append(current, line)
+	}
+	flush()
+	return docs
+}
+
+// applyObject creates one object, given as JSON, on the API server. Its
+// "kind" says what it is. An object that lives in a namespace goes in the
+// namespace its metadata names, or else the one from -n.
+func (c *cli) applyObject(data []byte) error {
+	var header struct {
+		Kind     string `json:"kind"`
+		Metadata struct {
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+	}
+	err := json.Unmarshal(data, &header)
 	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return err
+	}
+
+	namespace, err := c.namespaceFor(header.Metadata.Namespace)
+	if err != nil {
+		return err
 	}
 
 	ok, err := c.applyWorkload(header.Kind, data, namespace)
 	if ok {
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-		return nil
+		return err
 	}
 
 	switch header.Kind {
@@ -46,33 +123,25 @@ func (c *cli) applyFile(path string) error {
 		var pod api.Pod
 		err = json.Unmarshal(data, &pod)
 		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
-		}
-		pod.Namespace = namespace
-		err = c.client.CreatePod(pod)
-		if err != nil {
 			return err
 		}
-		fmt.Printf("pod/%s created in namespace %s\n", pod.Name, namespace)
+		pod.Namespace = namespace
+		return created("pod", pod.Name, namespace, c.client.CreatePod(pod))
 
 	case "ReplicaSet":
 		var rs api.ReplicaSet
 		err = json.Unmarshal(data, &rs)
 		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
-		}
-		rs.Namespace = namespace
-		err = c.client.CreateReplicaSet(rs)
-		if err != nil {
 			return err
 		}
-		fmt.Printf("replicaset/%s created in namespace %s\n", rs.Name, namespace)
+		rs.Namespace = namespace
+		return created("replicaset", rs.Name, namespace, c.client.CreateReplicaSet(rs))
 
 	case "Deployment":
 		var d api.Deployment
 		err = json.Unmarshal(data, &d)
 		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
+			return err
 		}
 		d.Namespace = namespace
 		return c.applyDeployment(d)
@@ -81,40 +150,50 @@ func (c *cli) applyFile(path string) error {
 		var svc api.Service
 		err = json.Unmarshal(data, &svc)
 		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
-		}
-		svc.Namespace = namespace
-		err = c.client.CreateService(svc)
-		if err != nil {
 			return err
 		}
-		fmt.Printf("service/%s created in namespace %s\n", svc.Name, namespace)
+		svc.Namespace = namespace
+		return created("service", svc.Name, namespace, c.client.CreateService(svc))
 
 	case "Node":
 		var node api.Node
 		err = json.Unmarshal(data, &node)
 		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
-		}
-		err = c.client.CreateNode(node)
-		if err != nil {
 			return err
 		}
-		fmt.Printf("node/%s created\n", node.Name)
+		return created("node", node.Name, "", c.client.CreateNode(node))
 
 	case "Namespace":
 		var ns api.Namespace
 		err = json.Unmarshal(data, &ns)
 		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
+			return err
 		}
 		return c.createNamespace(ns.Name)
 
 	case "":
-		return fmt.Errorf("%s: missing \"kind\", such as \"Pod\" or \"Deployment\"", path)
+		return errors.New(`missing "kind", such as "Pod" or "Deployment"`)
 	default:
-		return fmt.Errorf("%s: unknown \"kind\": %s", path, header.Kind)
+		return fmt.Errorf(`unknown "kind": %s`, header.Kind)
 	}
+}
+
+// created reports the result of creating an object that apply can't update.
+// If it already exists, it is left as it is, so that applying the same files
+// again works.
+func created(label, name, namespace string, err error) error {
+	where := ""
+	if namespace != "" {
+		where = " in namespace " + namespace
+	}
+	switch {
+	case errors.Is(err, client.ErrConflict):
+		fmt.Printf("%s/%s already exists%s, left as it is (delete it first to change it)\n", label, name, where)
+		return nil
+	case err != nil:
+		return err
+	}
+	fmt.Printf("%s/%s created%s\n", label, name, where)
 	return nil
 }
 

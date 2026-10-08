@@ -1,7 +1,9 @@
 package kubelet
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -26,6 +28,24 @@ func probeSettings(p *api.Probe) (initialDelay, period time.Duration, threshold 
 		threshold = p.FailureThreshold
 	}
 	return initialDelay, period, threshold
+}
+
+// runProbe runs a probe of container c: an exec probe runs its command
+// inside the container; the others go to the container's address.
+func (k *Kubelet) runProbe(pod api.Pod, c api.Container, p *api.Probe, address string) bool {
+	if p == nil || p.Exec == nil {
+		return check(p, address)
+	}
+
+	timeout := 3 * time.Second
+	if p.TimeoutSeconds > 0 {
+		timeout = time.Duration(p.TimeoutSeconds) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	code, err := k.runtime.Exec(ctx, pod, c, p.Exec.Command, nil, io.Discard)
+	return err == nil && code == 0
 }
 
 // check runs a probe against a container's address. A nil probe, or one

@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: flaky
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: main
+        image: busybox:1.36
+        command: ["sh", "-c", "echo working; sleep 10; echo oops; exit 1"]

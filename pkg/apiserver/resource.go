@@ -11,6 +11,12 @@ import (
 
 // rules are what differs between kinds of object in serveResource.
 type rules[T any] struct {
+	// kind is the kind's name, such as "Job".
+	kind string
+
+	// typeMeta returns where an object keeps its apiVersion and kind.
+	typeMeta func(*T) *api.TypeMeta
+
 	// prepare fills in defaults and checks an object before it is stored. An
 	// error becomes a 400 Bad Request answer.
 	prepare func(*T) error
@@ -22,23 +28,25 @@ type rules[T any] struct {
 }
 
 // serveResource registers the routes for one kind of namespaced object,
-// such as jobs. plural is how the kind appears in URLs:
+// such as jobs. plural is how the kind appears in URLs; the URLs start with
+// the kind's API group, here /apis/batch/v1:
 //
-//	GET    /api/jobs                                      in every namespace
-//	GET    /api/namespaces/{namespace}/jobs
-//	POST   /api/namespaces/{namespace}/jobs
-//	GET    /api/namespaces/{namespace}/jobs/{name}
-//	PUT    /api/namespaces/{namespace}/jobs/{name}
-//	PUT    /api/namespaces/{namespace}/jobs/{name}/status if the kind has a status
-//	DELETE /api/namespaces/{namespace}/jobs/{name}
-func serveResource[T any](mux *http.ServeMux, plural, label string, res *store.Resource[T], r rules[T]) {
-	list := func(w http.ResponseWriter, req *http.Request) {
-		writeJSON(w, http.StatusOK, res.List(req.PathValue("namespace")))
-	}
-	mux.HandleFunc("GET /api/"+plural, list)
-	mux.HandleFunc("GET /api/namespaces/{namespace}/"+plural, list)
+//	GET    /apis/batch/v1/jobs                                      in every namespace
+//	GET    /apis/batch/v1/namespaces/{namespace}/jobs
+//	POST   /apis/batch/v1/namespaces/{namespace}/jobs
+//	GET    /apis/batch/v1/namespaces/{namespace}/jobs/{name}
+//	PUT    /apis/batch/v1/namespaces/{namespace}/jobs/{name}
+//	PUT    /apis/batch/v1/namespaces/{namespace}/jobs/{name}/status if the kind has a status
+//	DELETE /apis/batch/v1/namespaces/{namespace}/jobs/{name}
+func serveResource[T any](mux *http.ServeMux, st *store.Store, plural, label string, res *store.Resource[T], r rules[T]) {
+	prefix := api.Prefix(plural)
+	list := watchable(st, plural, func(w http.ResponseWriter, req *http.Request) {
+		writeList(w, req, res.List(req.PathValue("namespace")))
+	})
+	mux.HandleFunc("GET "+prefix+"/"+plural, list)
+	mux.HandleFunc("GET "+prefix+"/namespaces/{namespace}/"+plural, list)
 
-	mux.HandleFunc("POST /api/namespaces/{namespace}/"+plural, func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("POST "+prefix+"/namespaces/{namespace}/"+plural, func(w http.ResponseWriter, req *http.Request) {
 		var obj T
 		if !decode(w, req, label, &obj) || !setNamespace(w, req, &res.Meta(&obj).Namespace) {
 			return
@@ -56,7 +64,7 @@ func serveResource[T any](mux *http.ServeMux, plural, label string, res *store.R
 			return
 		}
 
-		err := res.Create(obj)
+		obj, err := res.Create(obj)
 		if err != nil {
 			http.Error(w, err.Error(), statusForError(err))
 			return
@@ -65,7 +73,7 @@ func serveResource[T any](mux *http.ServeMux, plural, label string, res *store.R
 		writeJSON(w, http.StatusCreated, obj)
 	})
 
-	path := "/api/namespaces/{namespace}/" + plural + "/{name}"
+	path := prefix + "/namespaces/{namespace}/" + plural + "/{name}"
 
 	mux.HandleFunc("GET "+path, func(w http.ResponseWriter, req *http.Request) {
 		namespace, name := req.PathValue("namespace"), req.PathValue("name")
@@ -95,7 +103,7 @@ func serveResource[T any](mux *http.ServeMux, plural, label string, res *store.R
 			return
 		}
 
-		err := res.Update(obj)
+		obj, err := res.Update(obj)
 		if err != nil {
 			http.Error(w, err.Error(), statusForError(err))
 			return
@@ -118,7 +126,11 @@ func serveResource[T any](mux *http.ServeMux, plural, label string, res *store.R
 			}
 
 			r.copyStatus(&obj, update) // only the status changes
-			err := res.Update(obj)
+
+			// The update must be based on the current version. Copy its
+			// resourceVersion, so a stale status update is refused.
+			res.Meta(&obj).ResourceVersion = res.Meta(&update).ResourceVersion
+			obj, err := res.Update(obj)
 			if err != nil {
 				http.Error(w, err.Error(), statusForError(err))
 				return
@@ -139,13 +151,13 @@ func serveResource[T any](mux *http.ServeMux, plural, label string, res *store.R
 	})
 }
 
-// prepare runs r.prepare, if the kind has one, and answers 400 Bad Request
-// if it fails.
+// prepare sets the object's apiVersion and kind, runs r.prepare if the kind
+// has one, and answers 400 Bad Request if anything is wrong.
 func prepare[T any](w http.ResponseWriter, r rules[T], obj *T) bool {
-	if r.prepare == nil {
-		return true
+	err := setKind(r.typeMeta(obj), r.kind)
+	if err == nil && r.prepare != nil {
+		err = r.prepare(obj)
 	}
-	err := r.prepare(obj)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return false
