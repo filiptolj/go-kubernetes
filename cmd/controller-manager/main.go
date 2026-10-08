@@ -34,10 +34,11 @@ func main() {
 		BackoffMax:   2 * time.Minute,
 		HealthyAfter: time.Minute,
 	}
-	deployments := &controller.DeploymentController{
-		Client: c,
-		Every:  time.Second,
-	}
+	deployments := &controller.DeploymentController{Client: c, Every: time.Second}
+	jobs := &controller.JobController{Client: c, Every: time.Second}
+	cronJobs := &controller.CronJobController{Client: c, Every: 5 * time.Second}
+	daemonSets := &controller.DaemonSetController{Client: c, Every: 2 * time.Second}
+	statefulSets := &controller.StatefulSetController{Client: c, Every: time.Second}
 
 	log.Printf("controller-manager started")
 
@@ -52,6 +53,18 @@ func main() {
 	})
 	wg.Go(func() {
 		deployments.Run(ctx)
+	})
+	wg.Go(func() {
+		jobs.Run(ctx)
+	})
+	wg.Go(func() {
+		cronJobs.Run(ctx)
+	})
+	wg.Go(func() {
+		daemonSets.Run(ctx)
+	})
+	wg.Go(func() {
+		statefulSets.Run(ctx)
 	})
 	wg.Wait()
 

@@ -25,8 +25,8 @@ func TestAPI(t *testing.T) {
 		{"GET", "/api/namespaces", "", http.StatusOK},
 
 		// Creating pods
-		{"POST", "/api/namespaces/default/pods", `{"name":"nginx"}`, http.StatusCreated},
-		{"POST", "/api/namespaces/default/pods", `{"name":"nginx"}`, http.StatusConflict},
+		{"POST", "/api/namespaces/default/pods", `{"name":"nginx","containers":[{"name":"c","image":"nginx"}]}`, http.StatusCreated},
+		{"POST", "/api/namespaces/default/pods", `{"name":"nginx","containers":[{"name":"c","image":"nginx"}]}`, http.StatusConflict},
 		{"POST", "/api/namespaces/default/pods", `{"name":`, http.StatusBadRequest},
 		{"POST", "/api/namespaces/default/pods", `{}`, http.StatusBadRequest},
 		{"GET", "/api/namespaces/default/pods/nginx", "", http.StatusOK},
@@ -47,14 +47,46 @@ func TestAPI(t *testing.T) {
 		{"POST", "/api/namespaces", `{"name":"dev"}`, http.StatusCreated},
 		{"POST", "/api/namespaces", `{"name":"dev"}`, http.StatusConflict},
 		{"POST", "/api/namespaces", `{"name":"Not_Valid"}`, http.StatusBadRequest},
-		{"POST", "/api/namespaces/nope/pods", `{"name":"x"}`, http.StatusNotFound},
-		{"POST", "/api/namespaces/dev/pods", `{"name":"nginx"}`, http.StatusCreated}, // same name, other namespace: fine
-		{"POST", "/api/namespaces/dev/pods", `{"name":"x","namespace":"default"}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/nope/pods", `{"name":"x","containers":[{"name":"c","image":"nginx"}]}`, http.StatusNotFound},
+		{"POST", "/api/namespaces/dev/pods", `{"name":"nginx","containers":[{"name":"c","image":"nginx"}]}`, http.StatusCreated}, // same name, other namespace: fine
+		{"POST", "/api/namespaces/dev/pods", `{"name":"x","namespace":"default","containers":[{"name":"c","image":"nginx"}]}`, http.StatusBadRequest},
 		{"GET", "/api/namespaces/dev/pods/nginx", "", http.StatusOK},
 		{"DELETE", "/api/namespaces/default", "", http.StatusConflict},
 		{"DELETE", "/api/namespaces/dev", "", http.StatusOK},
 		{"GET", "/api/namespaces/dev/pods/nginx", "", http.StatusNotFound},
 		{"GET", "/api/namespaces/default/pods/nginx", "", http.StatusOK}, // default's nginx is untouched
+
+		// Pod validation
+		{"POST", "/api/namespaces/default/pods", `{"name":"empty"}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/pods", `{"name":"p","restartPolicy":"Sometimes","containers":[{"name":"c","image":"nginx"}]}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/pods", `{"name":"p","containers":[{"name":"c","livenessProbe":{}}]}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/pods", `{"name":"p","containers":[{"name":"c","volumeMounts":[{"name":"nope","mountPath":"/x"}]}]}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/pods", `{"name":"p","volumes":[{"name":"v"}],"containers":[{"name":"c","image":"nginx"}]}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/pods", `{"name":"p","containers":[{"name":"c","env":[{"name":"X","valueFrom":{}}]}]}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/pods", `{"name":"ok","volumes":[{"name":"v","emptyDir":{}}],"containers":[{"name":"c","volumeMounts":[{"name":"v","mountPath":"/data"}]}]}`, http.StatusCreated},
+
+		// Jobs and CronJobs
+		{"POST", "/api/namespaces/default/jobs", `{"name":"pi","template":"containers":[{"name":"c","image":"nginx"}]}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/jobs", `{"name":"pi","template":{"containers":[{"name":"c","image":"nginx"}]}}`, http.StatusCreated},
+		{"POST", "/api/namespaces/default/jobs", `{"name":"bad","template":{"restartPolicy":"Always","containers":[{"name":"c","image":"nginx"}]}}`, http.StatusBadRequest},
+		{"GET", "/api/namespaces/default/jobs/pi", "", http.StatusOK},
+		{"PUT", "/api/namespaces/default/jobs/pi/status", `{"status":{"succeeded":1}}`, http.StatusOK},
+		{"PUT", "/api/namespaces/default/jobs/nope/status", `{"status":{}}`, http.StatusNotFound},
+		{"POST", "/api/namespaces/default/cronjobs", `{"name":"c","schedule":"*/5 * * * *","jobTemplate":{"template":{"containers":[{"name":"c","image":"nginx"}]}}}`, http.StatusCreated},
+		{"POST", "/api/namespaces/default/cronjobs", `{"name":"c2","schedule":"every day","jobTemplate":{"template":{"containers":[{"name":"c","image":"nginx"}]}}}`, http.StatusBadRequest},
+		{"GET", "/api/cronjobs", "", http.StatusOK},
+
+		// DaemonSets, StatefulSets, ConfigMaps, Secrets
+		{"POST", "/api/namespaces/default/daemonsets", `{"name":"agent","template":{"containers":[{"name":"c","image":"nginx"}]}}`, http.StatusCreated},
+		{"POST", "/api/namespaces/default/daemonsets", `{"name":"agent2","template":{"restartPolicy":"Never","containers":[{"name":"c","image":"nginx"}]}}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/statefulsets", `{"name":"db","replicas":3,"template":{"containers":[{"name":"c","image":"nginx"}]}}`, http.StatusCreated},
+		{"POST", "/api/namespaces/default/statefulsets", `{"name":"db2","replicas":-1,"template":{"containers":[{"name":"c","image":"nginx"}]}}`, http.StatusBadRequest},
+		{"POST", "/api/namespaces/default/configmaps", `{"name":"settings","data":{"mode":"fast"}}`, http.StatusCreated},
+		{"POST", "/api/namespaces/default/configmaps", `{"name":"bad","data":{"../x":"y"}}`, http.StatusBadRequest},
+		{"PUT", "/api/namespaces/default/configmaps/settings", `{"data":{"mode":"slow"}}`, http.StatusOK},
+		{"POST", "/api/namespaces/default/secrets", `{"name":"db","data":{"password":"hunter2"}}`, http.StatusCreated},
+		{"DELETE", "/api/namespaces/default/secrets/db", "", http.StatusOK},
+		{"DELETE", "/api/namespaces/default/secrets/db", "", http.StatusNotFound},
 
 		// ReplicaSets
 		{"POST", "/api/namespaces/default/replicasets", `{"name":"web","replicas":2,"template":{"containers":[{"name":"c","image":"nginx"}]}}`, http.StatusCreated},

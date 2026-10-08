@@ -68,6 +68,20 @@ func NewHandler(st *store.Store) http.Handler {
 
 	mux.HandleFunc("GET /api/events", s.handleListEvents)
 	mux.HandleFunc("POST /api/events", s.handleRecordEvent)
+
+	// The newer kinds all use the same generic routes.
+	serveResource(mux, "jobs", "job", st.Jobs, rules[api.Job]{
+		prepare:    prepareJob,
+		copyStatus: func(dst *api.Job, src api.Job) { dst.Status = src.Status },
+	})
+	serveResource(mux, "cronjobs", "cronjob", st.CronJobs, rules[api.CronJob]{
+		prepare:    prepareCronJob,
+		copyStatus: func(dst *api.CronJob, src api.CronJob) { dst.Status = src.Status },
+	})
+	serveResource(mux, "daemonsets", "daemonset", st.DaemonSets, rules[api.DaemonSet]{prepare: prepareDaemonSet})
+	serveResource(mux, "statefulsets", "statefulset", st.StatefulSets, rules[api.StatefulSet]{prepare: prepareStatefulSet})
+	serveResource(mux, "configmaps", "configmap", st.ConfigMaps, rules[api.ConfigMap]{prepare: prepareConfigMap})
+	serveResource(mux, "secrets", "secret", st.Secrets, rules[api.Secret]{prepare: prepareSecret})
 	return mux
 }
 

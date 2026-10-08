@@ -2,33 +2,57 @@ package kubelet
 
 import (
 	"errors"
-	"log"
 	"net"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 )
 
-// probeEvery is how often waitUntilReady checks a starting pod.
+// probeEvery is how often the readiness of containers without a readiness
+// probe is checked.
 const probeEvery = 500 * time.Millisecond
 
-// waitUntilReady checks the pod's address until something answers there,
-// then reports the pod ready. It gives up if the pod stops running here.
-func (k *Kubelet) waitUntilReady(pod api.Pod, address string) {
-	key := api.Key(pod.Namespace, pod.Name)
-	for k.isRunning(key) {
-		if probe(address) {
-			err := k.client.SetPodStatus(pod.Namespace, pod.Name, api.PodStatus{Phase: api.PodRunning, Ready: true, Address: address})
-			if err != nil {
-				log.Printf("could not report pod %s as ready: %v", key, err)
-				return
-			}
-			log.Printf("pod %s is ready", key)
-			k.events.Normal("Pod", pod.Namespace, pod.Name, "Ready", "answering on %s", address)
-			return
-		}
-		time.Sleep(probeEvery)
+// probeSettings returns a probe's settings, with the defaults filled in.
+func probeSettings(p *api.Probe) (initialDelay, period time.Duration, threshold int) {
+	initialDelay = time.Duration(p.InitialDelaySeconds) * time.Second
+	period = 10 * time.Second
+	if p.PeriodSeconds > 0 {
+		period = time.Duration(p.PeriodSeconds) * time.Second
 	}
+	threshold = 3
+	if p.FailureThreshold > 0 {
+		threshold = p.FailureThreshold
+	}
+	return initialDelay, period, threshold
+}
+
+// check runs a probe against a container's address. A nil probe, or one
+// without httpGet, only checks that something answers on the port.
+func check(p *api.Probe, address string) bool {
+	if address == "" {
+		return false
+	}
+	if p != nil && p.HTTPGet != nil {
+		return checkHTTP(address, p.HTTPGet.Path)
+	}
+	return probe(address)
+}
+
+// checkHTTP sends a GET request; a status from 200 to 399 means healthy.
+func checkHTTP(address, path string) bool {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	client := http.Client{Timeout: time.Second}
+	resp, err := client.Get("http://" + address + path)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 400
 }
 
 // probe reports whether a program is listening at address.

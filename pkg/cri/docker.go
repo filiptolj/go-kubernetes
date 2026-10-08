@@ -2,7 +2,7 @@ package cri
 
 import (
 	"fmt"
-	"io"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -28,7 +28,11 @@ func containerName(pod api.Pod, c api.Container) string {
 // Start runs `docker run` for the container. The docker process keeps running
 // as long as the container does, and exits with the container's exit code.
 // If the container has a Port, it is published on a free port of this machine.
-func (dr DockerRuntime) Start(pod api.Pod, c api.Container, logs io.Writer) (Running, error) {
+//
+// Environment variables are passed in a file only the current user can read,
+// not on the command line, where anyone on the machine could see them with
+// `ps`: they may come from Secrets.
+func (dr DockerRuntime) Start(pod api.Pod, c api.Container, opts Options) (Running, error) {
 	if c.Image == "" {
 		return Running{}, fmt.Errorf("container %q has no image", c.Name)
 	}
@@ -55,14 +59,52 @@ func (dr DockerRuntime) Start(pod api.Pod, c api.Container, logs io.Writer) (Run
 		address = fmt.Sprintf("127.0.0.1:%d", hostPort)
 	}
 
+	for _, m := range opts.Mounts {
+		volume := m.HostPath + ":" + m.ContainerPath
+		if m.ReadOnly {
+			volume += ":ro"
+		}
+		args = append(args, "-v", volume)
+	}
+
+	var envFile string
+	if len(opts.Env) > 0 {
+		f, err := os.CreateTemp("", "minik8s-env-*") // CreateTemp makes it readable by us only
+		if err != nil {
+			return Running{}, fmt.Errorf("container %q: %w", c.Name, err)
+		}
+		envFile = f.Name()
+		_, err = f.WriteString(strings.Join(opts.Env, "\n") + "\n")
+		f.Close()
+		if err != nil {
+			os.Remove(envFile)
+			return Running{}, fmt.Errorf("container %q: %w", c.Name, err)
+		}
+		args = append(args, "--env-file", envFile)
+	}
+
 	args = append(args, c.Image)
 	args = append(args, c.Command...)
 
-	done, err := start(exec.Command("docker", args...), logs)
+	done, err := start(exec.Command("docker", args...), opts.Logs)
 	if err != nil {
+		os.Remove(envFile)
 		return Running{}, fmt.Errorf("start container %q: %w", c.Name, err)
 	}
-	return Running{Done: done, Address: address}, nil
+
+	if envFile == "" {
+		return Running{Done: done, Address: address}, nil
+	}
+
+	// Docker has read the file once the container runs, but we only know that
+	// for sure when it exits. Remove the file then, and pass the result on.
+	result := make(chan error, 1)
+	go func() {
+		err := <-done
+		os.Remove(envFile)
+		result <- err
+	}()
+	return Running{Done: result, Address: address}, nil
 }
 
 // Stop removes the container. Its `docker run` process then exits on its own.

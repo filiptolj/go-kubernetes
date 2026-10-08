@@ -50,6 +50,8 @@ func TestDeleteNamespaceDeletesEverythingInIt(t *testing.T) {
 		s.RecordEvent(api.Event{Namespace: ns, Kind: "Pod", Name: "web-1", Type: api.EventNormal, Reason: "Test"})
 	}
 	s.CreateService(api.Service{Namespace: "dev", Name: "web", Port: 8081})
+	s.Jobs.Create(api.Job{Meta: api.Meta{Namespace: "dev", Name: "report"}})
+	s.Secrets.Create(api.Secret{Meta: api.Meta{Namespace: "dev", Name: "db"}})
 
 	events, stop := s.WatchPods()
 	defer stop()
@@ -66,7 +68,8 @@ func TestDeleteNamespaceDeletesEverythingInIt(t *testing.T) {
 	}
 
 	if n := len(s.ListPods("dev")) + len(s.ListReplicaSets("dev")) + len(s.ListDeployments("dev")) +
-		len(s.ListServices("dev")) + len(s.ListEvents("dev", "", "")); n != 0 {
+		len(s.ListServices("dev")) + len(s.ListEvents("dev", "", "")) +
+		len(s.Jobs.List("dev")) + len(s.Secrets.List("dev")); n != 0 {
 		t.Errorf("%d objects left in the deleted namespace, want 0", n)
 	}
 	if n := len(s.ListPods("default")) + len(s.ListReplicaSets("default")) + len(s.ListDeployments("default")); n != 3 {

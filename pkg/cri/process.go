@@ -2,7 +2,7 @@ package cri
 
 import (
 	"fmt"
-	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -25,13 +25,20 @@ func NewProcessRuntime() *ProcessRuntime {
 // Start runs the container's command as a process. A process shares this
 // machine's network, so it is reachable on its own Port: two copies of the
 // same pod on one node would clash.
-func (pr *ProcessRuntime) Start(pod api.Pod, c api.Container, logs io.Writer) (Running, error) {
+//
+// A plain process can't see volumes at other paths, so pods with volumes
+// need the Docker runtime.
+func (pr *ProcessRuntime) Start(pod api.Pod, c api.Container, opts Options) (Running, error) {
 	if len(c.Command) == 0 {
 		return Running{}, fmt.Errorf("container %q has no command to run", c.Name)
 	}
+	if len(opts.Mounts) > 0 {
+		return Running{}, fmt.Errorf("container %q mounts volumes, which only the docker runtime supports", c.Name)
+	}
 
 	cmd := exec.Command(c.Command[0], c.Command[1:]...)
-	done, err := start(cmd, logs)
+	cmd.Env = append(os.Environ(), opts.Env...)
+	done, err := start(cmd, opts.Logs)
 	if err != nil {
 		return Running{}, fmt.Errorf("start container %q: %w", c.Name, err)
 	}

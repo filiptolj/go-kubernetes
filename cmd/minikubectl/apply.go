@@ -33,6 +33,14 @@ func (c *cli) applyFile(path string) error {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 
+	ok, err := c.applyWorkload(header.Kind, data, namespace)
+	if ok {
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		return nil
+	}
+
 	switch header.Kind {
 	case "Pod":
 		var pod api.Pod
@@ -103,7 +111,7 @@ func (c *cli) applyFile(path string) error {
 		return c.createNamespace(ns.Name)
 
 	case "":
-		return fmt.Errorf("%s: missing \"kind\" (expected Pod, ReplicaSet, Deployment, Service, Node or Namespace)", path)
+		return fmt.Errorf("%s: missing \"kind\", such as \"Pod\" or \"Deployment\"", path)
 	default:
 		return fmt.Errorf("%s: unknown \"kind\": %s", path, header.Kind)
 	}
@@ -181,7 +189,11 @@ func (c *cli) delete(resource, name string) error {
 		}
 		return err
 	default:
-		return fmt.Errorf("can't delete %q", resource)
+		ok, err := c.deleteWorkload(resource, name)
+		if !ok {
+			return fmt.Errorf("can't delete %q", resource)
+		}
+		return err
 	}
 
 	if err != nil {
@@ -191,8 +203,22 @@ func (c *cli) delete(resource, name string) error {
 	return nil
 }
 
-// scale changes the number of replicas of a ReplicaSet or a Deployment.
+// scale changes the number of replicas of a ReplicaSet, Deployment or StatefulSet.
 func (c *cli) scale(resource, name string, replicas int) error {
+	if isStatefulSet(resource) {
+		ss, err := c.client.StatefulSets().Get(c.namespace, name)
+		if err != nil {
+			return err
+		}
+		ss.Replicas = replicas
+		err = c.client.StatefulSets().Update(c.namespace, name, ss)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("statefulset/%s scaled to %d\n", name, replicas)
+		return nil
+	}
+
 	if isDeployment(resource) {
 		err := c.client.ScaleDeployment(c.namespace, name, replicas)
 		if err != nil {

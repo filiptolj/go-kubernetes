@@ -67,6 +67,11 @@ func Open(b Backend) (*Store, error) {
 	if err == nil {
 		err = loadInto(s.namespaces, objects[kindNamespaces])
 	}
+	for _, r := range s.resources {
+		if err == nil {
+			err = r.load(objects[r.backendKind()])
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load saved objects: %w", err)
 	}

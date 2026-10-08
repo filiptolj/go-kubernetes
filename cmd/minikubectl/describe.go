@@ -26,9 +26,13 @@ func (c *cli) describe(resource, name string) error {
 		return c.describeService(name)
 	case isNamespace(resource):
 		return c.describeNamespace(name)
-	default:
+	}
+
+	ok, err := c.describeWorkload(resource, name)
+	if !ok {
 		return fmt.Errorf("can't describe %q", resource)
 	}
+	return err
 }
 
 func (c *cli) describePod(name string) error {
@@ -41,13 +45,19 @@ func (c *cli) describePod(name string) error {
 	field("Namespace", pod.Namespace)
 	field("Labels", formatLabels(pod.Labels))
 	if pod.Owner != "" {
-		field("Owner", "ReplicaSet/"+pod.Owner)
+		kind := pod.OwnerKind
+		if kind == "" {
+			kind = "ReplicaSet"
+		}
+		field("Owner", kind+"/"+pod.Owner)
 	} else {
 		field("Owner", "<none>")
 	}
 	field("Node", orNone(pod.NodeName))
-	field("Status", string(pod.Phase))
+	field("Status", podStatus(pod))
 	field("Ready", yesNo(pod.Ready))
+	field("Restarts", fmt.Sprint(pod.Restarts))
+	field("Restart", string(pod.RestartPolicy))
 	field("Address", orNone(pod.Address))
 	field("Started", formatTime(pod.StartedAt))
 	field("Finished", formatTime(pod.FinishedAt))
@@ -59,6 +69,30 @@ func (c *cli) describePod(name string) error {
 		fmt.Printf("    %-10s %s\n", "Command:", orNone(strings.Join(ctr.Command, " ")))
 		if ctr.Port != 0 {
 			fmt.Printf("    %-10s %d\n", "Port:", ctr.Port)
+		}
+		for _, e := range ctr.Env {
+			value := e.Value
+			if e.ValueFrom != nil && e.ValueFrom.ConfigMapKeyRef != nil {
+				value = fmt.Sprintf("<configmap %s, key %s>", e.ValueFrom.ConfigMapKeyRef.Name, e.ValueFrom.ConfigMapKeyRef.Key)
+			} else if e.ValueFrom != nil {
+				value = fmt.Sprintf("<secret %s, key %s>", e.ValueFrom.SecretKeyRef.Name, e.ValueFrom.SecretKeyRef.Key)
+			}
+			fmt.Printf("    %-10s %s=%s\n", "Env:", e.Name, value)
+		}
+		for _, m := range ctr.VolumeMounts {
+			fmt.Printf("    %-10s %s at %s\n", "Mount:", m.Name, m.MountPath)
+		}
+		if p := ctr.LivenessProbe; p != nil {
+			fmt.Printf("    %-10s %s\n", "Liveness:", describeProbe(p))
+		}
+		if p := ctr.ReadinessProbe; p != nil {
+			fmt.Printf("    %-10s %s\n", "Readiness:", describeProbe(p))
+		}
+	}
+	if len(pod.Volumes) > 0 {
+		fmt.Println("Volumes:")
+		for _, v := range pod.Volumes {
+			fmt.Printf("  %-12s %s\n", v.Name+":", describeVolume(v))
 		}
 	}
 
@@ -126,7 +160,7 @@ func (c *cli) describeReplicaSet(name string) error {
 	}
 	var owned []api.Pod
 	for _, pod := range pods {
-		if pod.Owner == rs.Name {
+		if pod.OwnedBy("ReplicaSet", rs.Name) {
 			owned = append(owned, pod)
 		}
 	}
@@ -286,10 +320,43 @@ func (c *cli) describeNamespace(name string) error {
 	return nil
 }
 
+// describeProbe says what a probe checks, for describe.
+func describeProbe(p *api.Probe) string {
+	check := "something answers on the port"
+	if p.HTTPGet != nil {
+		check = "GET " + p.HTTPGet.Path
+	}
+	period, threshold := 10, 3
+	if p.PeriodSeconds > 0 {
+		period = p.PeriodSeconds
+	}
+	if p.FailureThreshold > 0 {
+		threshold = p.FailureThreshold
+	}
+	return fmt.Sprintf("%s, every %ds, %d failures in a row to fail", check, period, threshold)
+}
+
+// describeVolume says where a volume's files come from, for describe.
+func describeVolume(v api.Volume) string {
+	switch {
+	case v.EmptyDir != nil:
+		return "empty folder, deleted with the pod"
+	case v.HostPath != nil:
+		return "the node's folder " + v.HostPath.Path
+	case v.ConfigMap != nil:
+		return "configmap " + v.ConfigMap.Name
+	default:
+		return "secret " + v.Secret.Name
+	}
+}
+
 // printTemplate prints a pod template's labels and containers.
 func printTemplate(t api.PodTemplate) {
 	fmt.Println("Pod template:")
 	fmt.Printf("  %-12s %s\n", "Labels:", formatLabels(t.Labels))
+	if t.RestartPolicy != "" {
+		fmt.Printf("  %-12s %s\n", "Restart:", t.RestartPolicy)
+	}
 	for _, ctr := range t.Containers {
 		line := ctr.Image
 		if len(ctr.Command) > 0 {

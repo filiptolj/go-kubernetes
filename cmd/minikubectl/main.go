@@ -15,14 +15,17 @@ import (
 const usage = `usage: minikubectl [-server URL] <command> [-n namespace | -A]
 
 commands:
-  get pods [-w] | nodes | replicasets | deployments | services | events | namespaces
+  get <resource> [-w for pods]
   apply -f <file.json>
   create namespace <name>
-  delete pod|replicaset|deployment|service|namespace <name>
-  scale replicaset|deployment <name> <replicas>
-  describe pod|node|replicaset|deployment|service|namespace <name>
+  delete <resource> <name>
+  scale replicaset|deployment|statefulset <name> <replicas>
+  describe <resource> <name>
   logs <pod> [-c container] [-f]
   version
+
+resources: pods, nodes, replicasets, deployments, statefulsets, daemonsets,
+jobs, cronjobs, services, configmaps, secrets, events, namespaces
 
 -n picks the namespace (default "default"); -A means every namespace.
 Both can go anywhere after the command.`
@@ -119,13 +122,13 @@ func (c *cli) run(args []string) error {
 
 	case "delete":
 		if len(args) < 3 {
-			return errors.New("usage: minikubectl delete pod|replicaset|deployment|service|namespace <name>")
+			return errors.New("usage: minikubectl delete <resource> <name>")
 		}
 		return c.delete(args[1], args[2])
 
 	case "scale":
-		if len(args) < 4 || !(isReplicaSet(args[1]) || isDeployment(args[1])) {
-			return errors.New("usage: minikubectl scale replicaset|deployment <name> <replicas>")
+		if len(args) < 4 || !(isReplicaSet(args[1]) || isDeployment(args[1]) || isStatefulSet(args[1])) {
+			return errors.New("usage: minikubectl scale replicaset|deployment|statefulset <name> <replicas>")
 		}
 		replicas, err := strconv.Atoi(args[3])
 		if err != nil || replicas < 0 {
@@ -135,7 +138,7 @@ func (c *cli) run(args []string) error {
 
 	case "describe":
 		if len(args) < 3 {
-			return errors.New("usage: minikubectl describe pod|node|replicaset|deployment|service|namespace <name>")
+			return errors.New("usage: minikubectl describe <resource> <name>")
 		}
 		return c.describe(args[1], args[2])
 

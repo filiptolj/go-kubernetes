@@ -92,7 +92,7 @@ func (rc *ReplicaSetController) reconcileAll() {
 	// A ReplicaSet only owns pods in its own namespace.
 	owned := make(map[string][]api.Pod)
 	for _, pod := range pods {
-		if pod.Owner != "" {
+		if pod.ControlledBy("ReplicaSet") {
 			owner := api.Key(pod.Namespace, pod.Owner)
 			owned[owner] = append(owned[owner], pod)
 		}
@@ -213,13 +213,7 @@ func (rc *ReplicaSetController) backingOff(rs api.ReplicaSet) bool {
 
 // createPod creates one new pod from the ReplicaSet's template.
 func (rc *ReplicaSetController) createPod(rs api.ReplicaSet) {
-	pod := api.Pod{
-		Name:       newPodName(rs.Name),
-		Namespace:  rs.Namespace,
-		Labels:     rs.Template.Labels,
-		Containers: rs.Template.Containers,
-		Owner:      rs.Name,
-	}
+	pod := newPod(newPodName(rs.Name), rs.Namespace, rs.Template, "ReplicaSet", rs.Name)
 
 	err := rc.Client.CreatePod(pod)
 	if err != nil {

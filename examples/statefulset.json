@@ -1,0 +1,11 @@
+{
+  "kind": "StatefulSet",
+  "name": "db",
+  "replicas": 3,
+  "template": {
+    "labels": { "app": "db" },
+    "containers": [
+      { "name": "nginx", "image": "nginx:1.27", "port": 80 }
+    ]
+  }
+}

@@ -65,6 +65,9 @@ func (dc *DeploymentController) reconcileAll() {
 	alive := make(map[string]int)
 	running := make(map[string]int)
 	for _, pod := range pods {
+		if !pod.ControlledBy("ReplicaSet") {
+			continue
+		}
 		owner := api.Key(pod.Namespace, pod.Owner)
 		if isAlive(pod) {
 			alive[owner]++

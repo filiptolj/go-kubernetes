@@ -1,0 +1,12 @@
+{
+  "kind": "CronJob",
+  "name": "clock",
+  "schedule": "* * * * *",
+  "jobTemplate": {
+    "template": {
+      "containers": [
+        { "name": "main", "image": "busybox:1.36", "command": ["sh", "-c", "echo the time is $(date +%H:%M)"] }
+      ]
+    }
+  }
+}

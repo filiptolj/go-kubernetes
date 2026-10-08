@@ -14,9 +14,8 @@ import (
 
 // Runtime starts and stops containers.
 type Runtime interface {
-	// Start starts one container of a pod and returns at once. Its output goes
-	// to logs.
-	Start(pod api.Pod, c api.Container, logs io.Writer) (Running, error)
+	// Start starts one container of a pod and returns at once.
+	Start(pod api.Pod, c api.Container, opts Options) (Running, error)
 
 	// Stop kills a container that Start started.
 	Stop(pod api.Pod, c api.Container) error
@@ -24,6 +23,21 @@ type Runtime interface {
 	// RemoveAll removes every container left over from an earlier run of
 	// this kubelet, for example one that crashed.
 	RemoveAll() error
+}
+
+// Options are what a container starts with, besides its image and command.
+// The kubelet works them out from the pod.
+type Options struct {
+	Logs   io.Writer // where the container's output goes
+	Env    []string  // environment variables, as "NAME=value"
+	Mounts []Mount   // folders of this machine to show inside the container
+}
+
+// Mount puts a folder of this machine at a path inside a container.
+type Mount struct {
+	HostPath      string
+	ContainerPath string
+	ReadOnly      bool
 }
 
 // Running is a container that Start started.

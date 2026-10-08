@@ -32,9 +32,13 @@ func (c *cli) get(resource string, watch bool) error {
 		return c.getEvents()
 	case isNamespace(resource):
 		return c.getNamespaces()
-	default:
+	}
+
+	ok, err := c.getWorkload(resource)
+	if !ok {
 		return fmt.Errorf("unknown resource %q", resource)
 	}
+	return err
 }
 
 // newTable returns a tabwriter for a table, and writes its header. With -A,
@@ -69,9 +73,9 @@ func (c *cli) getPods(watch bool) error {
 		return err
 	}
 
-	w := c.newTable("NAME\tSTATUS\tREADY\tNODE\tADDRESS")
+	w := c.newTable("NAME\tSTATUS\tREADY\tRESTARTS\tNODE\tADDRESS")
 	for _, pod := range pods {
-		c.row(w, pod.Namespace, pod.Name, pod.Phase, yesNo(pod.Ready), orNone(pod.NodeName), orNone(pod.Address))
+		c.row(w, pod.Namespace, pod.Name, podStatus(pod), yesNo(pod.Ready), pod.Restarts, orNone(pod.NodeName), orNone(pod.Address))
 	}
 	w.Flush()
 
@@ -96,7 +100,7 @@ func (c *cli) getPods(watch bool) error {
 		if c.all {
 			name = api.Key(pod.Namespace, pod.Name)
 		}
-		fmt.Printf("%-8s %-30s %-10s %s\n", event.Type, name, pod.Phase, orNone(pod.NodeName))
+		fmt.Printf("%-8s %-30s %-16s %s\n", event.Type, name, podStatus(pod), orNone(pod.NodeName))
 	}
 
 	if ctx.Err() != nil {
@@ -161,6 +165,9 @@ func (c *cli) getReplicaSets() error {
 	current := make(map[string]int)
 	running := make(map[string]int)
 	for _, pod := range pods {
+		if !pod.ControlledBy("ReplicaSet") {
+			continue
+		}
 		owner := api.Key(pod.Namespace, pod.Owner)
 		switch pod.Phase {
 		case api.PodPending:
@@ -223,7 +230,7 @@ func (c *cli) getDeployments() error {
 func readyByOwner(pods []api.Pod) map[string]int {
 	ready := make(map[string]int)
 	for _, pod := range pods {
-		if pod.Phase == api.PodRunning && pod.Ready {
+		if pod.ControlledBy("ReplicaSet") && pod.Phase == api.PodRunning && pod.Ready {
 			ready[api.Key(pod.Namespace, pod.Owner)]++
 		}
 	}

@@ -35,8 +35,8 @@ func (s *Store) ListNamespaces() []api.Namespace {
 	return sortedValues(s.namespaces)
 }
 
-// DeleteNamespace removes a namespace and everything in it: its Services,
-// Deployments, ReplicaSets, pods and events. Watchers see the pods deleted,
+// DeleteNamespace removes a namespace and everything in it: its objects of
+// every kind, its pods and its events. Watchers see the pods deleted,
 // so kubelets stop them. The default namespace can't be deleted.
 func (s *Store) DeleteNamespace(name string) error {
 	s.mu.Lock()
@@ -52,6 +52,13 @@ func (s *Store) DeleteNamespace(name string) error {
 
 	// Delete from the top down: first what creates pods, then the pods. If a
 	// step fails halfway, deleting the namespace again finishes the job.
+	for _, r := range s.resources {
+		err := r.deleteNamespace(name)
+		if err != nil {
+			return err
+		}
+	}
+
 	err := deleteAllIn(s, kindServices, s.services, name)
 	if err == nil {
 		err = deleteAllIn(s, kindDeployments, s.deployments, name)

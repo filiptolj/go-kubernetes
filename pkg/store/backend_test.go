@@ -26,6 +26,8 @@ func testBackend(t *testing.T, open func() Backend) {
 	first.CreateReplicaSet(api.ReplicaSet{Namespace: ns, Name: "web", Replicas: 3})
 	first.CreateDeployment(api.Deployment{Namespace: ns, Name: "app", Replicas: 2})
 	first.CreateService(api.Service{Namespace: ns, Name: "svc", Port: 8081, Selector: api.Labels{"app": "web"}})
+	first.Jobs.Create(api.Job{Meta: api.Meta{Name: "report", Namespace: ns}, JobSpec: api.JobSpec{Completions: 2}})
+	first.ConfigMaps.Create(api.ConfigMap{Meta: api.Meta{Name: "settings", Namespace: ns}, Data: map[string]string{"mode": "fast"}})
 	first.Close()
 
 	second, err := Open(open())
@@ -53,6 +55,12 @@ func testBackend(t *testing.T, open func() Backend) {
 	}
 	if svcs := second.ListServices(""); len(svcs) != 1 || svcs[0].Selector["app"] != "web" {
 		t.Errorf("after reopening: got services %+v, want svc selecting app=web", svcs)
+	}
+	if job, ok := second.Jobs.Get(ns, "report"); !ok || job.Completions != 2 {
+		t.Errorf("after reopening: got job %+v (found: %t), want report with 2 completions", job, ok)
+	}
+	if cm, ok := second.ConfigMaps.Get(ns, "settings"); !ok || cm.Data["mode"] != "fast" {
+		t.Errorf("after reopening: got configmap %+v (found: %t), want settings with mode=fast", cm, ok)
 	}
 }
 

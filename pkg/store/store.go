@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -34,6 +35,17 @@ type Store struct {
 	deployments map[string]api.Deployment
 	services    map[string]api.Service
 	namespaces  map[string]api.Namespace
+
+	// The newer kinds, stored with the generic Resource type. resources
+	// lists them all, so the store can load and clean them in one loop.
+	Jobs         *Resource[api.Job]
+	CronJobs     *Resource[api.CronJob]
+	DaemonSets   *Resource[api.DaemonSet]
+	StatefulSets *Resource[api.StatefulSet]
+	ConfigMaps   *Resource[api.ConfigMap]
+	Secrets      *Resource[api.Secret]
+	resources    []resource
+
 	events      []api.Event
 	nextEventID int
 	watchers    map[int]chan api.PodEvent
@@ -43,7 +55,7 @@ type Store struct {
 // New returns a Store that keeps everything in memory only. It starts with
 // just the default namespace.
 func New() *Store {
-	return &Store{
+	s := &Store{
 		pods:        make(map[string]api.Pod),
 		nodes:       make(map[string]api.Node),
 		replicaSets: make(map[string]api.ReplicaSet),
@@ -54,6 +66,14 @@ func New() *Store {
 		},
 		watchers: make(map[int]chan api.PodEvent),
 	}
+
+	s.Jobs = newResource(s, "jobs", "job", func(j *api.Job) *api.Meta { return &j.Meta })
+	s.CronJobs = newResource(s, "cronJobs", "cronjob", func(c *api.CronJob) *api.Meta { return &c.Meta })
+	s.DaemonSets = newResource(s, "daemonSets", "daemonset", func(d *api.DaemonSet) *api.Meta { return &d.Meta })
+	s.StatefulSets = newResource(s, "statefulSets", "statefulset", func(ss *api.StatefulSet) *api.Meta { return &ss.Meta })
+	s.ConfigMaps = newResource(s, "configMaps", "configmap", func(c *api.ConfigMap) *api.Meta { return &c.Meta })
+	s.Secrets = newResource(s, "secrets", "secret", func(sec *api.Secret) *api.Meta { return &sec.Meta })
+	return s
 }
 
 // CreatePod saves a new pod. It fails if a pod with that name already exists.
@@ -71,6 +91,10 @@ func (s *Store) CreatePod(pod api.Pod) error {
 	if exists {
 		return fmt.Errorf("pod %q already exists in namespace %q: %w", pod.Name, pod.Namespace, ErrConflict)
 	}
+
+	// rand.Text returns a random string: 26 letters and digits, too many
+	// combinations for two pods to ever get the same one.
+	pod.UID = rand.Text()
 
 	err = s.put(kindPods, key, pod)
 	if err != nil {
@@ -229,6 +253,8 @@ func (s *Store) SetPodStatus(namespace, name string, status api.PodStatus) (api.
 
 	pod.Phase = status.Phase
 	pod.Ready = status.Ready && status.Phase == api.PodRunning
+	pod.Restarts = status.Restarts
+	pod.Reason = status.Reason
 	if status.Address != "" {
 		pod.Address = status.Address
 	}

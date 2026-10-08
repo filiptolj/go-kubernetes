@@ -27,9 +27,19 @@ func (s *server) handleCreatePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if pod.RestartPolicy == "" {
+		pod.RestartPolicy = api.RestartAlways
+	}
+	err := validatePodSpec(pod.Containers, pod.Volumes, pod.RestartPolicy,
+		api.RestartAlways, api.RestartOnFailure, api.RestartNever)
+	if err != nil {
+		http.Error(w, "pod: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	pod.Phase = api.PodPending
 
-	err := s.store.CreatePod(pod)
+	err = s.store.CreatePod(pod)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return

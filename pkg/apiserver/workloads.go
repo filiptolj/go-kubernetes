@@ -28,12 +28,14 @@ func (s *server) handleCreateReplicaSet(w http.ResponseWriter, r *http.Request) 
 	case rs.Replicas < 0:
 		http.Error(w, "replicas can't be negative", http.StatusBadRequest)
 		return
-	case len(rs.Template.Containers) == 0:
-		http.Error(w, "template needs at least one container", http.StatusBadRequest)
+	}
+	err := prepareTemplate(&rs.Template)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	err := s.store.CreateReplicaSet(rs)
+	err = s.store.CreateReplicaSet(rs)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return
@@ -79,19 +81,17 @@ func (s *server) handleScaleReplicaSet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rs)
 }
 
-// validateDeployment checks a Deployment from a request.
-func validateDeployment(d api.Deployment) error {
+// validateDeployment fills in a Deployment's defaults and checks it.
+func validateDeployment(d *api.Deployment) error {
 	switch {
 	case d.Name == "":
 		return errors.New("deployment name is required")
 	case d.Replicas < 0:
 		return errors.New("replicas can't be negative")
-	case len(d.Template.Containers) == 0:
-		return errors.New("template needs at least one container")
 	case len(d.Template.Labels) == 0:
 		return errors.New("template needs labels, so the deployment's pods can be found")
 	}
-	return nil
+	return prepareTemplate(&d.Template)
 }
 
 // handleListDeployments returns the Deployments in the URL's namespace, or
@@ -107,7 +107,7 @@ func (s *server) handleCreateDeployment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err := validateDeployment(d)
+	err := validateDeployment(&d)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -132,7 +132,7 @@ func (s *server) handleUpdateDeployment(w http.ResponseWriter, r *http.Request) 
 
 	// The name in the URL wins, like for nodes.
 	d.Name = r.PathValue("name")
-	err := validateDeployment(d)
+	err := validateDeployment(&d)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
