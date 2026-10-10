@@ -101,5 +101,7 @@ func (nc *NodeController) events() *client.Recorder {
 
 // isAlive reports whether a pod is still waiting to run or running.
 func isAlive(pod api.Pod) bool {
-	return pod.Phase == api.PodPending || pod.Phase == api.PodRunning
+	// A Terminating pod is on its way out: its replacement is started at
+	// once, without waiting for it to stop.
+	return (pod.Phase == api.PodPending || pod.Phase == api.PodRunning) && !pod.Terminating()
 }

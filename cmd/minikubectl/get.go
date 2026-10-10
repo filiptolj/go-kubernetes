@@ -295,7 +295,7 @@ func (c *cli) getServices() error {
 // Service's namespace, matches its selector, and is running and ready.
 func serves(pod api.Pod, svc api.Service) bool {
 	return pod.Namespace == svc.Namespace && pod.Labels.Matches(svc.Selector) &&
-		pod.Phase == api.PodRunning && pod.Ready && pod.Address != ""
+		pod.Phase == api.PodRunning && pod.Ready && !pod.Terminating() && pod.Address != ""
 }
 
 // getEvents prints the events in the namespace, or in every namespace with

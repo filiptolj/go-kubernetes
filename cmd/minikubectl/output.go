@@ -79,7 +79,7 @@ func pluralFor(resource string) (string, bool) {
 		{isPod, "pods"}, {isNode, "nodes"}, {isReplicaSet, "replicasets"}, {isDeployment, "deployments"},
 		{isService, "services"}, {isNamespace, "namespaces"}, {isJob, "jobs"}, {isCronJob, "cronjobs"},
 		{isDaemonSet, "daemonsets"}, {isStatefulSet, "statefulsets"}, {isConfigMap, "configmaps"},
-		{isSecret, "secrets"}, {isIngress, "ingresses"},
+		{isSecret, "secrets"}, {isIngress, "ingresses"}, {isAutoscaler, "horizontalpodautoscalers"}, {isLease, "leases"},
 	} {
 		if k.is(resource) {
 			return k.plural, true

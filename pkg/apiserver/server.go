@@ -65,6 +65,7 @@ func NewHandler(st *store.Store) http.Handler {
 	mux.HandleFunc("GET "+apps+"/replicasets", watchable(st, "replicasets", s.handleListReplicaSets))
 	mux.HandleFunc("GET "+apps+inNamespace+"/replicasets", watchable(st, "replicasets", s.handleListReplicaSets))
 	mux.HandleFunc("POST "+apps+inNamespace+"/replicasets", s.handleCreateReplicaSet)
+	mux.HandleFunc("PUT "+apps+inNamespace+"/replicasets/{name}", s.handleUpdateReplicaSet)
 	mux.HandleFunc("DELETE "+apps+inNamespace+"/replicasets/{name}", s.handleDeleteReplicaSet)
 	mux.HandleFunc("POST "+apps+inNamespace+"/replicasets/{name}/scale", s.handleScaleReplicaSet)
 
@@ -102,6 +103,17 @@ func NewHandler(st *store.Store) http.Handler {
 		kind:     "ConfigMap",
 		typeMeta: func(c *api.ConfigMap) *api.TypeMeta { return &c.TypeMeta },
 		prepare:  prepareConfigMap,
+	})
+	serveResource(mux, st, "horizontalpodautoscalers", "horizontalpodautoscaler", st.Autoscalers, rules[api.HorizontalPodAutoscaler]{
+		kind:       "HorizontalPodAutoscaler",
+		typeMeta:   func(h *api.HorizontalPodAutoscaler) *api.TypeMeta { return &h.TypeMeta },
+		prepare:    prepareAutoscaler,
+		copyStatus: func(dst *api.HorizontalPodAutoscaler, src api.HorizontalPodAutoscaler) { dst.Status = src.Status },
+	})
+	serveResource(mux, st, "leases", "lease", st.Leases, rules[api.Lease]{
+		kind:     "Lease",
+		typeMeta: func(l *api.Lease) *api.TypeMeta { return &l.TypeMeta },
+		prepare:  func(*api.Lease) error { return nil },
 	})
 	serveResource(mux, st, "ingresses", "ingress", st.Ingresses, rules[api.Ingress]{
 		kind:     "Ingress",

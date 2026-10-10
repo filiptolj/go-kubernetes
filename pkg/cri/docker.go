@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 )
@@ -244,9 +246,17 @@ func (dr DockerRuntime) Exec(ctx context.Context, pod api.Pod, c api.Container, 
 	return runExec(exec.CommandContext(ctx, "docker", args...), stdin, out)
 }
 
-// Stop removes the container. Its `docker run` process then exits on its own.
-func (dr DockerRuntime) Stop(pod api.Pod, c api.Container) error {
-	out, err := exec.Command("docker", "rm", "-f", containerName(pod, c)).CombinedOutput()
+// Stop stops the container, gracefully if grace > 0, and removes it. Its
+// `docker run` process then exits on its own.
+func (dr DockerRuntime) Stop(pod api.Pod, c api.Container, grace time.Duration) error {
+	name := containerName(pod, c)
+	if grace > 0 {
+		// `docker stop` sends SIGTERM, waits, then sends SIGKILL. It fails
+		// harmlessly if the container has already gone.
+		seconds := int(math.Ceil(grace.Seconds()))
+		exec.Command("docker", "stop", "-t", strconv.Itoa(seconds), name).Run()
+	}
+	out, err := exec.Command("docker", "rm", "-f", name).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("stop container %q: %v: %s", c.Name, err, out)
 	}
@@ -271,4 +281,58 @@ func (dr DockerRuntime) RemoveAll() error {
 		return fmt.Errorf("remove containers: %v: %s", err, out)
 	}
 	return nil
+}
+
+// PodUsage asks `docker stats` what every container uses, and adds it up
+// per pod. Docker reports CPU as a percentage of one core: 100% is 1000
+// millicores.
+func (dr DockerRuntime) PodUsage(pods []api.Pod) (map[string]api.Resources, error) {
+	out, err := exec.Command("docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}").Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker stats: %w", err)
+	}
+
+	byName := make(map[string]api.Resources)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 3 {
+			continue
+		}
+		percent, err1 := strconv.ParseFloat(strings.TrimSuffix(fields[1], "%"), 64)
+		used, _, _ := strings.Cut(fields[2], " / ") // "3.07MiB / 6.698GiB"
+		memory, err2 := parseDockerSize(used)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		byName[fields[0]] = api.Resources{CPU: int64(percent * 10), Memory: memory}
+	}
+
+	usage := make(map[string]api.Resources)
+	for _, pod := range pods {
+		var total api.Resources
+		for _, c := range pod.Containers {
+			total = total.Add(byName[containerName(pod, c)])
+		}
+		usage[api.Key(pod.Namespace, pod.Name)] = total
+	}
+	return usage, nil
+}
+
+// parseDockerSize reads a size the way docker stats writes it, such as
+// "3.07MiB" or "512kB", in bytes.
+func parseDockerSize(s string) (int64, error) {
+	units := []struct {
+		suffix string
+		bytes  float64
+	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"GB", 1e9}, {"MB", 1e6}, {"kB", 1e3}, {"B", 1}}
+	for _, u := range units {
+		if number, ok := strings.CutSuffix(s, u.suffix); ok {
+			f, err := strconv.ParseFloat(number, 64)
+			if err != nil {
+				return 0, err
+			}
+			return int64(f * u.bytes), nil
+		}
+	}
+	return 0, fmt.Errorf("can't read size %q", s)
 }

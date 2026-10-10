@@ -332,3 +332,65 @@ func TestWatchOneKindInOneNamespace(t *testing.T) {
 	default:
 	}
 }
+
+func TestFinalizers(t *testing.T) {
+	s := New()
+	cm := api.ConfigMap{ObjectMeta: meta("settings")}
+	cm.Finalizers = []string{"example.com/backup"}
+	s.ConfigMaps.Create(cm)
+
+	// Deleting only marks it: the finalizer's work isn't done yet.
+	if err := s.ConfigMaps.Delete(ns, "settings"); err != nil {
+		t.Fatal(err)
+	}
+	marked, ok := s.ConfigMaps.Get(ns, "settings")
+	if !ok || !marked.Terminating() {
+		t.Fatalf("after delete: got %+v (found: %t), want it still there, terminating", marked.ObjectMeta, ok)
+	}
+
+	// Clients can't take the mark back.
+	marked.DeletionTimestamp = nil
+	marked.Data = map[string]string{"changed": "yes"}
+	updated, _ := s.ConfigMaps.Update(marked)
+	if !updated.Terminating() {
+		t.Error("an update cleared the deletion mark")
+	}
+
+	// Removing the last finalizer lets it go.
+	updated.Finalizers = nil
+	if _, err := s.ConfigMaps.Update(updated); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.ConfigMaps.Get(ns, "settings"); ok {
+		t.Error("still there after its last finalizer was removed")
+	}
+}
+
+func TestDeletePodGracefully(t *testing.T) {
+	s := New()
+	s.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-1"}, NodeStatus: api.NodeStatus{Ready: true}})
+	s.CreatePod(api.Pod{ObjectMeta: meta("unscheduled")})
+	s.CreatePod(api.Pod{ObjectMeta: meta("running")})
+	s.BindPod(ns, "running", "node-1")
+	s.SetPodStatus(ns, "running", api.PodStatus{Phase: api.PodRunning})
+
+	// No node: nothing to stop, so it goes at once.
+	if _, removed, _ := s.DeletePodGracefully(ns, "unscheduled", -1); !removed {
+		t.Error("a pod without a node wasn't removed at once")
+	}
+
+	// On a node: marked, with the pod's default grace period.
+	pod, removed, _ := s.DeletePodGracefully(ns, "running", -1)
+	if removed || !pod.Terminating() || *pod.DeletionGracePeriodSeconds != api.DefaultTerminationGracePeriod {
+		t.Fatalf("got removed %t, %+v; want it terminating with %ds", removed, pod.ObjectMeta, api.DefaultTerminationGracePeriod)
+	}
+
+	// Asking again with less time shortens it; with 0, it goes.
+	pod, _, _ = s.DeletePodGracefully(ns, "running", 5)
+	if *pod.DeletionGracePeriodSeconds != 5 {
+		t.Errorf("got grace %d, want it shortened to 5", *pod.DeletionGracePeriodSeconds)
+	}
+	if _, removed, _ := s.DeletePodGracefully(ns, "running", 0); !removed {
+		t.Error("grace 0 didn't remove the pod")
+	}
+}

@@ -24,6 +24,7 @@ type runningPod struct {
 
 	// The fields below are guarded by Kubelet.mu.
 	stopping     bool                       // the kubelet is stopping it on purpose
+	terminating  bool                       // it is being deleted gracefully
 	containers   map[string]*containerState // by container name
 	restarts     int
 	reason       string       // such as "CrashLoopBackOff"
@@ -237,7 +238,7 @@ func (k *Kubelet) runOnce(ctx context.Context, rp *runningPod, c api.Container, 
 	// If the pod was stopped while the container was starting, the stop may
 	// have come too early to catch it. Stop it again now.
 	if ctx.Err() != nil {
-		k.runtime.Stop(pod, c)
+		k.runtime.Stop(pod, c, 0)
 		<-running.Done
 		return nil
 	}
@@ -301,7 +302,7 @@ func (k *Kubelet) waitContainer(rp *runningPod, c api.Container, running cri.Run
 
 		k.events.Normal("Pod", rp.pod.Namespace, rp.pod.Name, "Killing",
 			"container %q failed its liveness probe; killing it", c.Name)
-		k.runtime.Stop(rp.pod, c)
+		k.runtime.Stop(rp.pod, c, time.Duration(rp.pod.GracePeriod())*time.Second)
 		<-running.Done
 		return errors.New("killed after failing its liveness probe")
 	}

@@ -167,7 +167,7 @@ func TestCronJob(t *testing.T) {
 
 	// Deleting the CronJob deletes its Jobs.
 	st.CronJobs.Delete(ns, "backup")
-	cc.reconcileAll()
+	(&GarbageCollector{Client: c}).collect()
 	if n := len(jobNames()); n != 0 {
 		t.Errorf("after deleting the cronjob: got %d jobs, want 0", n)
 	}
@@ -244,8 +244,22 @@ func TestDaemonSetRunsOnEveryReadyNode(t *testing.T) {
 	st.DaemonSets.Update(ds)
 
 	dc.reconcileAll()
-	if n := len(st.ListPods(ns)); n != 2 {
-		t.Errorf("first step of the update: got %d pods, want 2 (one replaced at a time)", n)
+	var staying, leaving []string
+	for _, pod := range st.ListPods(ns) {
+		if pod.Terminating() {
+			leaving = append(leaving, pod.Name)
+		} else {
+			staying = append(staying, pod.Name)
+		}
+	}
+	if len(staying) != 2 || len(leaving) != 1 {
+		t.Errorf("first step of the update: got pods %v and terminating %v, want 2 and 1 (one replaced at a time)", staying, leaving)
+	}
+
+	// While it terminates, nothing more happens: its replacement needs its name.
+	dc.reconcileAll()
+	if n := len(st.ListPods(ns)); n != 3 {
+		t.Errorf("while one pod terminates: got %d pods, want still 3", n)
 	}
 }
 

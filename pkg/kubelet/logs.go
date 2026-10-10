@@ -17,10 +17,12 @@ import (
 //
 //	GET  /logs/{namespace}/{pod}/{container}  a container's logs; ?follow=true keeps sending new output
 //	POST /exec/{namespace}/{pod}/{container}  run a command in a container; see handleExec
+//	GET  /stats                               what each running pod uses; see metrics.go
 func (k *Kubelet) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs/{namespace}/{pod}/{container}", k.handleLogs)
 	mux.HandleFunc("POST /exec/{namespace}/{pod}/{container}", k.handleExec)
+	mux.HandleFunc("GET /stats", k.handleStats)
 	return mux
 }
 

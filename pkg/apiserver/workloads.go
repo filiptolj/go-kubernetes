@@ -15,24 +15,51 @@ func (s *server) handleListReplicaSets(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreateReplicaSet reads a ReplicaSet from the request body and stores it.
+// handleUpdateReplicaSet replaces a ReplicaSet. The Deployment controller
+// uses it to renumber an old ReplicaSet that becomes current again.
+func (s *server) handleUpdateReplicaSet(w http.ResponseWriter, r *http.Request) {
+	var rs api.ReplicaSet
+	if !decode(w, r, "replicaset", &rs) || !setNamespace(w, r, &rs.Namespace) {
+		return
+	}
+	rs.Name = r.PathValue("name") // the name in the URL wins
+
+	err := checkReplicaSet(&rs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rs, err = s.store.UpdateReplicaSet(rs)
+	if err != nil {
+		http.Error(w, err.Error(), statusForError(err))
+		return
+	}
+	log.Printf("updated replicaset %s", api.Key(rs.Namespace, rs.Name))
+	writeJSON(w, http.StatusOK, rs)
+}
+
+// checkReplicaSet checks a ReplicaSet and fills in its defaults.
+func checkReplicaSet(rs *api.ReplicaSet) error {
+	switch {
+	case rs.Name == "":
+		return errors.New("replicaset name is required")
+	case rs.Replicas < 0:
+		return errors.New("replicas can't be negative")
+	}
+	err := setKind(&rs.TypeMeta, "ReplicaSet")
+	if err != nil {
+		return err
+	}
+	return prepareTemplate(&rs.Template)
+}
+
 func (s *server) handleCreateReplicaSet(w http.ResponseWriter, r *http.Request) {
 	var rs api.ReplicaSet
 	if !decode(w, r, "replicaset", &rs) || !setNamespace(w, r, &rs.Namespace) {
 		return
 	}
 
-	switch {
-	case rs.Name == "":
-		http.Error(w, "replicaset name is required", http.StatusBadRequest)
-		return
-	case rs.Replicas < 0:
-		http.Error(w, "replicas can't be negative", http.StatusBadRequest)
-		return
-	}
-	err := setKind(&rs.TypeMeta, "ReplicaSet")
-	if err == nil {
-		err = prepareTemplate(&rs.Template)
-	}
+	err := checkReplicaSet(&rs)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

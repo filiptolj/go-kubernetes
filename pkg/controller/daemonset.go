@@ -28,7 +28,7 @@ func (dc *DaemonSetController) Run(ctx context.Context) {
 		dc.Informers.daemonSets(), dc.Informers.nodes(), dc.Informers.pods())
 }
 
-// reconcileAll checks every DaemonSet, and removes pods whose DaemonSet is gone.
+// reconcileAll checks every DaemonSet.
 func (dc *DaemonSetController) reconcileAll() {
 	dc.expected.check() // before reading: see expectations.go
 	sets, err := list(dc.Informers.daemonSets(), dc.Client.DaemonSets().List)
@@ -48,21 +48,11 @@ func (dc *DaemonSetController) reconcileAll() {
 	}
 
 	owned := groupByOwner(pods, "DaemonSet")
-	exists := make(map[string]bool)
 	for _, ds := range sets {
 		key := api.Key(ds.Namespace, ds.Name)
-		exists[key] = true
 		dc.reconcile(ds, owned[key], nodes)
 	}
 
-	for owner, pods := range owned {
-		if exists[owner] {
-			continue
-		}
-		for _, pod := range pods {
-			dc.deletePod(pod, fmt.Sprintf("its daemonset %q is gone", pod.OwnerName()))
-		}
-	}
 }
 
 // reconcile makes sure every ready node runs exactly one pod of the
@@ -75,7 +65,12 @@ func (dc *DaemonSetController) reconcile(ds api.DaemonSet, pods []api.Pod, nodes
 	hash := templateHash(ds.Template)
 
 	onNode := make(map[string][]api.Pod)
+	leaving := make(map[string]bool) // nodes with a Terminating pod, whose name the new one needs
 	for _, pod := range pods {
+		if pod.Terminating() {
+			leaving[pod.NodeName] = true
+			continue
+		}
 		if !isAlive(pod) {
 			dc.deletePod(pod, "it finished") // a fresh one takes its place
 			continue
@@ -91,7 +86,7 @@ func (dc *DaemonSetController) reconcile(ds api.DaemonSet, pods []api.Pod, nodes
 		ready[node.Name] = true
 
 		running := onNode[node.Name]
-		if len(running) == 0 {
+		if len(running) == 0 && !leaving[node.Name] {
 			dc.createPod(ds, node.Name, hash)
 		}
 		for _, extra := range running[min(1, len(running)):] {
@@ -111,6 +106,11 @@ func (dc *DaemonSetController) reconcile(ds api.DaemonSet, pods []api.Pod, nodes
 				dc.deletePod(pod, fmt.Sprintf("its node %q is gone", nodeName))
 			}
 		}
+	}
+
+	// One pod at a time: while one is still leaving, wait.
+	if len(leaving) > 0 {
+		return
 	}
 
 	// A rolling update: once every node's pod is ready, replace one pod that

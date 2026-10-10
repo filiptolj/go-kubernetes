@@ -2,6 +2,7 @@ package cri
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 )
@@ -84,6 +86,11 @@ func (pr *ProcessRuntime) Exec(ctx context.Context, pod api.Pod, c api.Container
 	return runExec(exec.CommandContext(ctx, command[0], command[1:]...), stdin, out)
 }
 
+// PodUsage isn't supported: plain processes aren't measured.
+func (pr *ProcessRuntime) PodUsage(pods []api.Pod) (map[string]api.Resources, error) {
+	return nil, errors.New("the process runtime can't measure what pods use")
+}
+
 // RemoveAll does nothing: a new kubelet can't find the processes started by
 // one that crashed.
 func (pr *ProcessRuntime) RemoveAll() error {
@@ -91,7 +98,7 @@ func (pr *ProcessRuntime) RemoveAll() error {
 }
 
 // Stop kills the container's process, and any processes it started.
-func (pr *ProcessRuntime) Stop(pod api.Pod, c api.Container) error {
+func (pr *ProcessRuntime) Stop(pod api.Pod, c api.Container, grace time.Duration) error {
 	key := processKey(pod, c)
 
 	pr.mu.Lock()
@@ -104,8 +111,20 @@ func (pr *ProcessRuntime) Stop(pod api.Pod, c api.Container) error {
 	}
 
 	// A negative PID means "the whole process group", so children such as a
-	// `sleep` started by `sh -c` are killed too.
-	return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	// `sleep` started by `sh -c` get the signal too.
+	group := -cmd.Process.Pid
+	if grace > 0 && syscall.Kill(group, syscall.SIGTERM) == nil {
+		// Signal 0 only checks that the group still exists.
+		deadline := time.Now().Add(grace)
+		for time.Now().Before(deadline) && syscall.Kill(group, 0) == nil {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	err := syscall.Kill(group, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil // it stopped on its own
+	}
+	return err
 }
 
 // processKey identifies a container's process: "namespace/pod/container".

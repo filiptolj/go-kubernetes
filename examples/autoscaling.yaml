@@ -1,0 +1,59 @@
+# Autoscaling, as in Kubernetes' own walkthrough: php-apache does some
+# arithmetic for every request, so more requests use more CPU. The
+# autoscaler keeps its pods near 50% of their CPU request.
+#
+#   minikubectl apply -f examples/autoscaling.yaml
+#   minikubectl apply -f examples/load-generator.yaml   # start the load
+#   minikubectl get hpa -w                               # or: minikubectl top pods
+#   minikubectl delete pod load-generator                # and it scales back down
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php-apache
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: php-apache
+    spec:
+      containers:
+      - name: php-apache
+        image: registry.k8s.io/hpa-example
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 200m
+          limits:
+            cpu: 500m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: php-apache
+spec:
+  selector:
+    app: php-apache
+  ports:
+  - port: 8082
+    targetPort: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: php-apache
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: php-apache
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50

@@ -246,11 +246,14 @@ func (c *cli) createNamespace(name string) error {
 }
 
 // delete deletes one object by name.
-func (c *cli) delete(resource, name string) error {
+//
+// A running pod is given grace seconds to stop (below 0: its own grace
+// period; 0: none), and is Terminating meanwhile.
+func (c *cli) delete(resource, name string, grace int) error {
 	var err error
 	switch {
 	case isPod(resource):
-		err = c.client.DeletePod(c.namespace, name)
+		err = c.client.DeletePodWithGrace(c.namespace, name, grace)
 		resource = "pod"
 	case isReplicaSet(resource):
 		err = c.client.DeleteReplicaSet(c.namespace, name)

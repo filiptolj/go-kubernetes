@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
@@ -26,7 +25,7 @@ func (jc *JobController) Run(ctx context.Context) {
 	client.RunOnChange(ctx, "job controller", jc.Every, jc.reconcileAll, jc.Informers.jobs(), jc.Informers.pods())
 }
 
-// reconcileAll moves every Job forward, and removes pods whose Job is gone.
+// reconcileAll moves every Job forward.
 func (jc *JobController) reconcileAll() {
 	jc.expected.check() // before reading: see expectations.go
 	jobs, err := list(jc.Informers.jobs(), jc.Client.Jobs().List)
@@ -41,21 +40,11 @@ func (jc *JobController) reconcileAll() {
 	}
 
 	owned := groupByOwner(pods, "Job")
-	exists := make(map[string]bool)
 	for _, job := range jobs {
 		key := api.Key(job.Namespace, job.Name)
-		exists[key] = true
 		jc.reconcile(job, owned[key])
 	}
 
-	for owner, pods := range owned {
-		if exists[owner] {
-			continue
-		}
-		for _, pod := range pods {
-			jc.deletePod(pod, fmt.Sprintf("its job %q is gone", pod.OwnerName()))
-		}
-	}
 }
 
 // reconcile counts a Job's pods, decides whether it has finished, starts
@@ -68,6 +57,9 @@ func (jc *JobController) reconcile(job api.Job, pods []api.Pod) {
 	var active []api.Pod
 	succeeded, failed := 0, 0
 	for _, pod := range pods {
+		if pod.Terminating() {
+			continue // on its way out
+		}
 		switch pod.Phase {
 		case api.PodSucceeded:
 			succeeded++

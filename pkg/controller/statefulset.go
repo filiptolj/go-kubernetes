@@ -31,7 +31,7 @@ func (sc *StatefulSetController) Run(ctx context.Context) {
 		sc.Informers.statefulSets(), sc.Informers.pods())
 }
 
-// reconcileAll checks every StatefulSet, and removes pods whose StatefulSet is gone.
+// reconcileAll checks every StatefulSet.
 func (sc *StatefulSetController) reconcileAll() {
 	sc.expected.check() // before reading: see expectations.go
 	sets, err := list(sc.Informers.statefulSets(), sc.Client.StatefulSets().List)
@@ -46,21 +46,11 @@ func (sc *StatefulSetController) reconcileAll() {
 	}
 
 	owned := groupByOwner(pods, "StatefulSet")
-	exists := make(map[string]bool)
 	for _, ss := range sets {
 		key := api.Key(ss.Namespace, ss.Name)
-		exists[key] = true
 		sc.reconcile(ss, owned[key])
 	}
 
-	for owner, pods := range owned {
-		if exists[owner] {
-			continue
-		}
-		for _, pod := range pods {
-			sc.deletePod(pod, fmt.Sprintf("its statefulset %q is gone", pod.OwnerName()))
-		}
-	}
 }
 
 // ordinal returns the number at the end of a StatefulSet pod's name: 2 for
@@ -89,6 +79,11 @@ func (sc *StatefulSetController) reconcile(ss api.StatefulSet, pods []api.Pod) {
 		n, ok := ordinal(ss, pod)
 		if !ok {
 			continue
+		}
+		if pod.Terminating() {
+			// Going one step at a time includes waiting for this one to be
+			// gone: its replacement will need its name.
+			return
 		}
 		if !isAlive(pod) {
 			// A finished pod is deleted, and created again with the same name.

@@ -93,6 +93,17 @@ func (r *Resource[T]) Update(obj T) (T, error) {
 	if err != nil {
 		return obj, fmt.Errorf("%s %q: %w", r.label, m.Name, err)
 	}
+
+	// An object waiting for its finalizers goes, once the last is removed.
+	if m.Terminating() && len(m.Finalizers) == 0 {
+		err = r.s.remove(r.kind, key, obj)
+		if err != nil {
+			return obj, err
+		}
+		delete(r.objects, key)
+		return obj, nil
+	}
+
 	err = r.s.put(api.EventModified, r.kind, key, obj)
 	if err != nil {
 		return obj, err
@@ -119,15 +130,29 @@ func (r *Resource[T]) List(namespace string) []T {
 	return inNamespace(r.objects, namespace)
 }
 
-// Delete removes one object.
+// Delete removes one object. An object with finalizers is only marked for
+// deletion; it goes once its finalizers are removed (see Update).
 func (r *Resource[T]) Delete(namespace, name string) error {
 	r.s.mu.Lock()
 	defer r.s.mu.Unlock()
 
 	key := api.Key(namespace, name)
-	_, ok := r.objects[key]
+	obj, ok := r.objects[key]
 	if !ok {
 		return fmt.Errorf("%s %q in namespace %q: %w", r.label, name, namespace, ErrNotFound)
+	}
+
+	if m := r.meta(&obj); len(m.Finalizers) > 0 {
+		if m.Terminating() {
+			return nil // already waiting
+		}
+		r.s.markForDeletion(m)
+		err := r.s.put(api.EventModified, r.kind, key, obj)
+		if err != nil {
+			return err
+		}
+		r.objects[key] = obj
+		return nil
 	}
 
 	err := r.s.remove(r.kind, key, r.objects[key])

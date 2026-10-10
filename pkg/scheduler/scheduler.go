@@ -58,7 +58,7 @@ func (s *Scheduler) scheduleAll() {
 	s.assumed = stillAssumed
 
 	for i, pod := range pods {
-		if pod.NodeName != "" || pod.Phase != api.PodPending {
+		if pod.NodeName != "" || pod.Phase != api.PodPending || pod.Terminating() {
 			continue
 		}
 		node, ok := s.schedule(pod, nodes, pods)

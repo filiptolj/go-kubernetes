@@ -47,6 +47,10 @@ func (c *cli) describePod(name string) error {
 	field("Owner", formatOwner(pod.ObjectMeta))
 	field("Node", orNone(pod.NodeName))
 	field("Status", podStatus(pod))
+	if pod.Terminating() {
+		field("Deleting", fmt.Sprintf("since %s, with %ds for its containers to stop",
+			formatTime(*pod.DeletionTimestamp), *pod.DeletionGracePeriodSeconds))
+	}
 	field("Ready", yesNo(pod.Ready))
 	field("Restarts", fmt.Sprint(pod.Restarts))
 	field("Restart", string(pod.RestartPolicy))
@@ -467,5 +471,5 @@ func formatTime(t time.Time) string {
 	if t.IsZero() {
 		return "<none>"
 	}
-	return t.Format("2006-01-02 15:04:05") + " (" + age(t) + " ago)"
+	return t.Local().Format("2006-01-02 15:04:05") + " (" + age(t) + " ago)"
 }

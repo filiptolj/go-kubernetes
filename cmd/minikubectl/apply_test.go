@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -63,13 +65,18 @@ func TestApplyExamples(t *testing.T) {
 		}
 	}
 
-	d := st.ListDeployments(api.DefaultNamespace)
-	if len(d) != 1 || d[0].Template.Containers[0].Ports[0].ContainerPort != 80 {
-		t.Errorf("got deployments %+v, want web with container port 80", d)
+	deployments := st.ListDeployments(api.DefaultNamespace)
+	i := slices.IndexFunc(deployments, func(d api.Deployment) bool { return d.Name == "web" })
+	if i < 0 || deployments[i].Template.Containers[0].Ports[0].ContainerPort != 80 {
+		t.Errorf("got deployments %+v, want web with container port 80", deployments)
 	}
-	svcs := st.ListServices(api.DefaultNamespace)
-	if len(svcs) != 1 || svcs[0].Ports[0].Port != 8081 || svcs[0].Ports[0].Target() != 80 {
-		t.Errorf("got services %+v, want web on 8081 -> 80", svcs)
+	services := st.ListServices(api.DefaultNamespace)
+	i = slices.IndexFunc(services, func(s api.Service) bool { return s.Name == "web" })
+	if i < 0 || services[i].Ports[0].Port != 8081 || services[i].Ports[0].Target() != 80 {
+		t.Errorf("got services %+v, want web on 8081 -> 80", services)
+	}
+	if _, ok := st.Autoscalers.Get(api.DefaultNamespace, "php-apache"); !ok {
+		t.Error("the autoscaler from autoscaling.yaml wasn't created")
 	}
 	secret, ok := st.Secrets.Get(api.DefaultNamespace, "app-secret")
 	if !ok || string(secret.Data["password"]) != "correct-horse-battery-staple" {
@@ -157,5 +164,41 @@ func TestGetCommandArguments(t *testing.T) {
 		if err := c.getCommand(args); err == nil {
 			t.Errorf("get %v: want an error", args)
 		}
+	}
+}
+
+func TestRolloutUndo(t *testing.T) {
+	c, st := newTestCLI(t)
+
+	template := func(image string) api.PodTemplateSpec {
+		return api.PodTemplateSpec{
+			ObjectMeta: api.ObjectMeta{Labels: api.Labels{"app": "web"}},
+			PodSpec:    api.PodSpec{Containers: []api.Container{{Name: "c", Image: image}}},
+		}
+	}
+	d, _ := st.CreateDeployment(api.Deployment{
+		ObjectMeta:     api.ObjectMeta{Name: "web", Namespace: "default"},
+		DeploymentSpec: api.DeploymentSpec{Replicas: 1, Template: template("v3")},
+	})
+	for rev, image := range map[int]string{1: "v1", 2: "v2", 3: "v3"} {
+		rs := api.ReplicaSet{
+			ObjectMeta: api.ObjectMeta{Name: "web-" + image, Namespace: "default",
+				Annotations: map[string]string{api.RevisionAnnotation: fmt.Sprint(rev)}},
+			ReplicaSetSpec: api.ReplicaSetSpec{Template: template(image)},
+		}
+		rs.SetOwner("Deployment", "web", d.UID)
+		st.CreateReplicaSet(rs)
+	}
+
+	image := func() string { return st.ListDeployments("default")[0].Template.Containers[0].Image }
+
+	if err := c.rolloutUndo("web", 0); err != nil || image() != "v2" {
+		t.Errorf("undo: got image %s, %v; want v2, the revision before v3", image(), err)
+	}
+	if err := c.rolloutUndo("web", 1); err != nil || image() != "v1" {
+		t.Errorf("undo to revision 1: got image %s, %v; want v1", image(), err)
+	}
+	if err := c.rolloutUndo("web", 9); err == nil {
+		t.Error("undo to a revision that doesn't exist: want an error")
 	}
 }

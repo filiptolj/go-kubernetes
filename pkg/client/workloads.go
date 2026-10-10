@@ -57,6 +57,15 @@ func (c *Client) CreateReplicaSet(rs api.ReplicaSet) error {
 	return nil
 }
 
+// UpdateReplicaSet replaces a ReplicaSet.
+func (c *Client) UpdateReplicaSet(rs api.ReplicaSet) error {
+	err := c.send(http.MethodPut, objectPath(rs.Namespace, "replicasets", rs.Name), rs, http.StatusOK)
+	if err != nil {
+		return fmt.Errorf("update replicaset %q: %w", rs.Name, err)
+	}
+	return nil
+}
+
 // DeleteReplicaSet removes a ReplicaSet.
 func (c *Client) DeleteReplicaSet(namespace, name string) error {
 	err := c.send(http.MethodDelete, objectPath(namespace, "replicasets", name), nil, http.StatusOK)

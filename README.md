@@ -54,6 +54,12 @@ Events:
 - **Services** that give a group of pods one address, with load balancing across the ready ones, reachable from pods and from your machine
 - **Ingress**: HTTP requests routed to Services by host name and path
 - **Self-healing**: a node that stops sending heartbeats is marked NotReady and its pods are replaced elsewhere
+- **Rollouts** you can follow and undo: `rollout status`, `rollout history` and `rollout undo` back to any revision kept
+- **Graceful deletion**: a deleted pod is `Terminating` while its containers get `terminationGracePeriodSeconds` to stop after SIGTERM; it gets no new traffic, and its replacement starts at once
+- **Finalizers**, which keep a deleted object until the work they name is done
+- **Garbage collection**: objects whose owner is gone are deleted, by their `ownerReferences`, like a Deployment's ReplicaSets and their pods
+- **Horizontal Pod Autoscaler**: the number of replicas follows the CPU the pods use; `minikubectl top` shows what pods and nodes use
+- **Leader election**: several schedulers or controller-managers can run, and only the one holding a `Lease` works; the others take over if it stops
 - **Namespaces**, so the same names can be used by different teams or apps
 - **Events** that record what happened to each object, shown by `minikubectl describe`
 - **Logs** of any container, also followed live with `-f`; **exec** to run a command inside one; **port-forward** to reach a pod's port
@@ -136,6 +142,7 @@ with `get`, `describe` and `logs`:
 | `init-and-exec.yaml` | an init container writes a web page before nginx starts; the readiness probe runs a command |
 | `ingress.yaml` | routes `shop.local` on the ingress port to the `web` Service |
 | `toolbox.yaml` | a busybox pod for looking around the pod network with `exec` |
+| `autoscaling.yaml`, `load-generator.yaml` | Kubernetes' autoscaling walkthrough: php-apache scales from 1 to 5 pods under load, and back once the load stops |
 
 `minikubectl apply -f examples/` applies the whole folder; applying it again
 updates what can be updated and leaves the rest as it is.
@@ -182,11 +189,14 @@ $ docker exec minik8s-etcd etcdctl get --prefix /minik8s/ --keys-only
 | `get <resource> [name]` | list objects; `-l app=web` picks them by label, `-o yaml`, `-o json` or `-o name` prints them in full, and `get pods -w` keeps watching for changes |
 | `describe <resource> <name>` | details and recent events |
 | `apply -f <file or folder>` | create the objects in YAML (or JSON) files, several per file separated by `---`; applying again updates them |
-| `delete <resource> <name>` | delete an object; a namespace is deleted with everything in it |
+| `delete <resource> <name> [--grace-period N \| --now]` | delete an object; a namespace is deleted with everything in it; a running pod is given its grace period to stop, or N seconds, or none |
 | `logs <pod> [-c container] [-f]` | a container's output; `-f` follows it |
 | `exec <pod> [-c container] [-i] -- <command>` | run a command in a container; `-i` passes your input to it, and `minikubectl` exits with the command's exit code |
 | `port-forward <pod> [local:]<port>` | reach a pod's port at `localhost:local`, until Ctrl+C |
 | `scale replicaset\|deployment\|statefulset <name> <n>` | change the number of replicas |
+| `rollout status\|history\|undo deployment <name>` | wait for a rollout to finish, list the revisions kept, or go back to the previous one (or `-to-revision N`) |
+| `autoscale deployment <name> -max N [-min 1] [-cpu-percent 80]` | create a HorizontalPodAutoscaler |
+| `top pods\|nodes` | the CPU and memory pods use right now, and their nodes' share |
 | `create namespace <name>` | create a namespace |
 
 The resources are `pods`, `nodes`, `replicasets`, `deployments`,
@@ -242,8 +252,8 @@ spec:
 
 | Kind | `apiVersion` | Main fields |
 |---|---|---|
-| `Pod` | `v1` | `spec`: `containers`, `initContainers`, `volumes`, `restartPolicy` |
-| `ReplicaSet`, `Deployment`, `StatefulSet` | `apps/v1` | `spec`: `replicas`, `template` (`metadata.labels` and a pod `spec`; Deployments need labels) |
+| `Pod` | `v1` | `spec`: `containers`, `initContainers`, `volumes`, `restartPolicy`, `terminationGracePeriodSeconds` (default 30) |
+| `ReplicaSet`, `Deployment`, `StatefulSet` | `apps/v1` | `spec`: `replicas`, `template` (`metadata.labels` and a pod `spec`; Deployments need labels); Deployments also `revisionHistoryLimit` (default 10) |
 | `DaemonSet` | `apps/v1` | `spec`: `template` |
 | `Job` | `batch/v1` | `spec`: `completions` (default 1), `parallelism` (default 1), `backoffLimit` (default 6), `template` |
 | `CronJob` | `batch/v1` | `spec`: `schedule` (cron format, such as `*/5 * * * *`), `suspend`, `jobTemplate.spec` (a Job's spec) |
@@ -251,9 +261,12 @@ spec:
 | `ConfigMap` | `v1` | `data` (keys and values) |
 | `Secret` | `v1` | `data` (values in base64) or `stringData` (plain values) |
 | `Ingress` | `networking.k8s.io/v1` | `spec.rules`: a `host` (or none, for any host) and `http.paths`, each a `path`, a `pathType` (`Prefix`, the default, or `Exact`) and a `backend.service` `name` and `port.number` |
+| `HorizontalPodAutoscaler` | `autoscaling/v2` | `spec`: `scaleTargetRef` (a Deployment or ReplicaSet), `minReplicas` (default 1), `maxReplicas`, and `metrics` with a cpu `averageUtilization` target |
+| `Lease` | `coordination.k8s.io/v1` | `spec`: `holderIdentity`, `renewTime`, `leaseDurationSeconds`; written by leader election |
 | `Namespace`, `Node` | `v1` | `metadata.name` |
 
-Every object has a `metadata.name`, and may have `labels`. Objects other
+Every object has a `metadata.name`, and may have `labels`, `annotations`
+and `finalizers`. Objects other
 than Nodes and Namespaces can name their `metadata.namespace`; otherwise `-n`
 decides, or `default`. The API server fills in `uid`, `creationTimestamp`
 and `resourceVersion`.
@@ -370,12 +383,58 @@ request's path.
                                          (DNS: web → 10.244.0.2)     (10.244.0.2)
 ```
 
+### Deleting things
+
+Objects record who created them in `metadata.ownerReferences`: a pod
+names its ReplicaSet, a ReplicaSet its Deployment. The **garbage
+collector** deletes every object whose owners are gone, so deleting a
+Deployment deletes its ReplicaSets, and then their pods. Before deleting
+anything, it checks with the API server that the owner really is gone.
+
+Deleting a running pod doesn't remove it at once: it gets a
+`deletionTimestamp` and shows as `Terminating`. Services stop sending it
+connections and its controller creates its replacement straight away.
+Its kubelet sends its containers SIGTERM, waits up to the pod's
+`terminationGracePeriodSeconds` for them to exit, kills what is left, and
+then deletes the pod for good. `delete --now` skips all that.
+
+An object with **finalizers** is only marked when it is deleted. It stays,
+with its `deletionTimestamp`, until whoever does the work each finalizer
+names removes it; once the list is empty, the object goes.
+
+### Autoscaling
+
+Each kubelet measures what its pods use, every 15 seconds, with
+`docker stats`, and serves it at `/stats`. The autoscaler asks every
+node, adds up the CPU of a Deployment's pods, divides by what they
+request, and sets the number of replicas to
+`ceil(pods × utilization / target)`, as Kubernetes does. It leaves
+things alone within 10% of the target, grows at most to double the pods
+at a time, and only shrinks once it has wanted fewer pods for a minute.
+
+### Leader election
+
+The scheduler and the controller-manager take part in leader election:
+several copies can run, but only the one holding the `Lease` called
+`scheduler` (or `controller-manager`) works. It renews the lease every 2
+seconds; if it stops for 15, another copy takes over. When it stops
+normally it gives the lease up, and the next copy starts at once. Two
+copies can't both win: each writes the lease with the `resourceVersion`
+it read, and the API server refuses the second write. Try it by starting
+a second scheduler next to `minik8s`:
+
+```bash
+./bin/scheduler -server http://localhost:8080 -id standby
+# leader election: "scheduler" is led by ...; waiting
+./bin/minikubectl get leases
+```
+
 ### Components
 
 | Program | Package | Role |
 |---|---|---|
 | `apiserver` | [`pkg/apiserver`](pkg/apiserver), [`pkg/store`](pkg/store) | the HTTP API, and storage in memory backed by etcd or a file |
-| `controller-manager` | [`pkg/controller`](pkg/controller), [`pkg/cron`](pkg/cron) | the node, ReplicaSet, Deployment, StatefulSet, DaemonSet, Job and CronJob controllers |
+| `controller-manager` | [`pkg/controller`](pkg/controller), [`pkg/cron`](pkg/cron), [`pkg/leader`](pkg/leader) | the node, ReplicaSet, Deployment, StatefulSet, DaemonSet, Job, CronJob and autoscaler controllers, and the garbage collector |
 | `scheduler` | [`pkg/scheduler`](pkg/scheduler) | assigns pods to nodes |
 | `kubelet` | [`pkg/kubelet`](pkg/kubelet), [`pkg/cri`](pkg/cri) | runs pods on one node: restarts containers, runs probes, sets up volumes and environment, serves logs and exec |
 | `proxy` | [`pkg/proxy`](pkg/proxy) | forwards connections on Service ports to ready pods and serves Ingresses; inside the pod network, also the cluster DNS |
@@ -393,7 +452,8 @@ pkg/
   apiserver/   HTTP handlers
   store/       objects in memory, saved to etcd or a file
   client/      the Go client for the API, used by every component
-  controller/  the reconcile loops
+  controller/  the reconcile loops, the garbage collector and the autoscaler
+  leader/      leader election with Leases
   cron/        reading cron schedules
   scheduler/   scheduling strategies
   kubelet/     running pods on a node
@@ -431,12 +491,14 @@ The overall design follows Kubernetes, but many things are simplified:
 - `minikubectl logs`, `exec` and `port-forward` talk to the kubelet, or the pod's published port, directly instead of going through the API server; `exec` has no terminal (`-t`).
 - A watch only sends changes from the moment it starts; there is no resuming from a `resourceVersion`.
 - Events are kept in memory only and are lost when the API server restarts.
-- Deleting a namespace or a pod happens at once; there is no `Terminating` state (deleted pods do get a 2-second grace period before their containers are stopped).
+- Deleting a namespace deletes everything in it at once, without grace periods or finalizers.
+- Finalizers work on the kinds stored generically (Jobs, CronJobs, DaemonSets, StatefulSets, ConfigMaps, Secrets, Ingresses, autoscalers, Leases), not on pods, ReplicaSets, Deployments, Services, Nodes or Namespaces. Deleting an owner always leaves its dependents to the garbage collector ("background" deletion).
 - Secrets are stored as plain text, not encrypted.
 - Volumes need the Docker runtime, and only `emptyDir`, `hostPath`, ConfigMaps and Secrets exist: there are no persistent volumes, so a StatefulSet's pods don't keep their data when they move.
 - Resource limits need the Docker runtime; the process runtime ignores them.
 - Ingress is HTTP only (no TLS), and has no ingress classes or default backend.
-- No network policies or autoscaling.
+- The autoscaler only follows CPU, and asks the kubelets directly instead of a metrics server. Kubernetes waits 5 minutes before scaling down; here it is 1.
+- No network policies.
 
 ## License
 

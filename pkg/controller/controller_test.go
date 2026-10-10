@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -109,7 +110,7 @@ func TestReplicaSetController(t *testing.T) {
 
 	// The ReplicaSet is deleted: its pods are garbage collected.
 	st.DeleteReplicaSet(ns, "web")
-	rc.reconcileAll()
+	(&GarbageCollector{Client: c}).collect()
 	if got := len(st.ListPods("")); got != 0 {
 		t.Errorf("after deleting the replicaset: got %d pods, want 0", got)
 	}
@@ -287,20 +288,43 @@ func TestDeploymentRollingUpdate(t *testing.T) {
 		}
 	}
 
-	sets = st.ListReplicaSets("")
-	if len(sets) != 1 || sets[0].Name == oldName || sets[0].Replicas != 3 {
-		t.Fatalf("after the update: got replicasets %+v, want only the new one with 3 replicas", sets)
+	// The old version is kept, scaled to 0, as revision 1.
+	replicas := func() map[string]string {
+		got := make(map[string]string)
+		for _, rs := range st.ListReplicaSets("") {
+			got[rs.Name] = fmt.Sprintf("%d replicas, revision %s", rs.Replicas, rs.Annotations[api.RevisionAnnotation])
+		}
+		return got
 	}
-	for _, pod := range alivePods(st, sets[0].Name) {
+	newName := "web-" + templateHash(deployment("nginx:1.28").Template)
+	want := map[string]string{oldName: "0 replicas, revision 1", newName: "3 replicas, revision 2"}
+	if got := replicas(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("after the update: got replicasets %v, want %v", got, want)
+	}
+	for _, pod := range alivePods(st, newName) {
 		if pod.Containers[0].Image != "nginx:1.28" {
 			t.Errorf("pod %s runs %s, want nginx:1.28", pod.Name, pod.Containers[0].Image)
 		}
 	}
 
+	// Going back to the old template (what `rollout undo` does) makes the
+	// old ReplicaSet current again, as the newest revision.
+	d := st.ListDeployments(ns)[0]
+	d.Template = deployment("nginx:1.27").Template
+	st.UpdateDeployment(d)
+	for range 20 {
+		step()
+	}
+	want = map[string]string{oldName: "3 replicas, revision 3", newName: "0 replicas, revision 2"}
+	if got := replicas(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("after going back: got replicasets %v, want %v", got, want)
+	}
+
 	// Deleting the deployment removes its replicaset, and then its pods.
 	st.DeleteDeployment(ns, "web")
-	step()
-	step()
+	gc := &GarbageCollector{Client: c}
+	gc.collect() // the ReplicaSet
+	gc.collect() // then its pods
 	if n := len(st.ListReplicaSets("")); n != 0 {
 		t.Errorf("after deleting the deployment: %d replicasets left, want 0", n)
 	}
@@ -422,4 +446,93 @@ func (w *slowWriter) Write(p []byte) (int, error) {
 // Unwrap lets http.NewResponseController reach the real writer, to flush it.
 func (w *slowWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+func TestGarbageCollector(t *testing.T) {
+	st, c := newTestCluster(t)
+	gc := &GarbageCollector{Client: c}
+
+	rs, _ := st.CreateReplicaSet(replicaSet(ns, "web", 1, tmpl(nil, "nginx")))
+	owned := func(name, uid string) api.Pod {
+		pod := api.Pod{ObjectMeta: meta(name)}
+		pod.SetOwner("ReplicaSet", "web", uid)
+		return pod
+	}
+	st.CreatePod(owned("mine", rs.UID))
+	st.CreatePod(owned("older-web", "an-old-uid")) // from an earlier ReplicaSet called web
+	st.CreatePod(owned("unknown-uid", ""))         // no UID: the name decides
+	st.CreatePod(api.Pod{ObjectMeta: meta("standalone")})
+	gone := api.Pod{ObjectMeta: meta("orphan")}
+	gone.SetOwner("ReplicaSet", "deleted", "x")
+	st.CreatePod(gone)
+	strange := api.Pod{ObjectMeta: meta("strange-owner")}
+	strange.SetOwner("Banana", "b", "y") // a kind it doesn't know: leave it alone
+	st.CreatePod(strange)
+
+	gc.collect()
+
+	var left []string
+	for _, pod := range st.ListPods(ns) {
+		left = append(left, pod.Name)
+	}
+	want := []string{"mine", "standalone", "strange-owner", "unknown-uid"}
+	if fmt.Sprint(left) != fmt.Sprint(want) {
+		t.Errorf("pods left: got %v, want %v", left, want)
+	}
+}
+
+func TestDeploymentKeepsLimitedHistory(t *testing.T) {
+	st, c := newTestCluster(t)
+	dc := &DeploymentController{Client: c}
+	rc := &ReplicaSetController{Client: c}
+
+	limit := 2
+	d := api.Deployment{ObjectMeta: meta("web"), DeploymentSpec: api.DeploymentSpec{Replicas: 1, RevisionHistoryLimit: &limit}}
+	st.CreateDeployment(d)
+	for _, image := range []string{"v1", "v2", "v3", "v4", "v5"} {
+		d := st.ListDeployments(ns)[0]
+		d.Template = tmpl(api.Labels{"app": "web"}, image)
+		st.UpdateDeployment(d)
+		for range 10 {
+			dc.reconcileAll()
+			rc.reconcileAll()
+			runPods(st)
+		}
+	}
+
+	// v5 runs; of the old versions, only the 2 newest are kept.
+	var revisions []string
+	for _, rs := range st.ListReplicaSets(ns) {
+		revisions = append(revisions, rs.Annotations[api.RevisionAnnotation])
+	}
+	slices.Sort(revisions)
+	if fmt.Sprint(revisions) != "[3 4 5]" {
+		t.Errorf("got revisions %v, want [3 4 5]", revisions)
+	}
+}
+
+func TestTerminatingPodIsReplacedAtOnce(t *testing.T) {
+	st, c := newTestCluster(t)
+	rc := &ReplicaSetController{Client: c}
+	st.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-1"}, NodeStatus: api.NodeStatus{Ready: true}})
+	st.CreateReplicaSet(replicaSet(ns, "web", 1, tmpl(nil, "nginx")))
+
+	rc.reconcileAll()
+	first := alivePods(st, "web")[0].Name
+	st.BindPod(ns, first, "node-1")
+	runPods(st)
+
+	// Deleted while running on a node: it terminates, and meanwhile a new
+	// pod takes its place.
+	st.DeletePodGracefully(ns, first, 30)
+	rc.reconcileAll()
+	rc.reconcileAll()
+
+	pods := alivePods(st, "web")
+	if len(pods) != 1 || pods[0].Name == first {
+		t.Errorf("got live pods %v, want one new pod", pods)
+	}
+	if old, ok := st.GetPod(ns, first); !ok || !old.Terminating() {
+		t.Errorf("the old pod should still be there, terminating: %+v", old.ObjectMeta)
+	}
 }

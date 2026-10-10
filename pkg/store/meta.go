@@ -31,6 +31,16 @@ func (s *Store) seeVersion(version string) {
 	}
 }
 
+// markForDeletion marks an object as being deleted, if it isn't yet: it
+// gets a DeletionTimestamp and a new resourceVersion.
+func (s *Store) markForDeletion(m *api.ObjectMeta) {
+	if m.DeletionTimestamp == nil {
+		now := time.Now().UTC().Truncate(time.Second)
+		m.DeletionTimestamp = &now
+	}
+	m.ResourceVersion = s.nextVersion()
+}
+
 // stampNew fills in the metadata of a new object.
 func (s *Store) stampNew(m *api.ObjectMeta) {
 	// rand.Text returns a random string: 26 letters and digits, too many
@@ -59,6 +69,10 @@ func (s *Store) stampUpdate(m *api.ObjectMeta, stored api.ObjectMeta) error {
 	if m.OwnerReferences == nil {
 		m.OwnerReferences = stored.OwnerReferences
 	}
+	// Only a delete can mark an object for deletion, and nothing can take
+	// the mark back.
+	m.DeletionTimestamp = stored.DeletionTimestamp
+	m.DeletionGracePeriodSeconds = stored.DeletionGracePeriodSeconds
 	m.ResourceVersion = s.nextVersion()
 	return nil
 }

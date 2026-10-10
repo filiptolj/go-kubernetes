@@ -46,7 +46,7 @@ func (cc *CronJobController) now() time.Time {
 	return time.Now()
 }
 
-// reconcileAll checks every CronJob, and removes Jobs whose CronJob is gone.
+// reconcileAll checks every CronJob.
 func (cc *CronJobController) reconcileAll() {
 	cc.expected.check() // before reading: see expectations.go
 	cronJobs, err := list(cc.Informers.cronJobs(), cc.Client.CronJobs().List)
@@ -68,21 +68,11 @@ func (cc *CronJobController) reconcileAll() {
 		}
 	}
 
-	exists := make(map[string]bool)
 	for _, cj := range cronJobs {
 		key := api.Key(cj.Namespace, cj.Name)
-		exists[key] = true
 		cc.reconcile(cj, owned[key])
 	}
 
-	for owner, jobs := range owned {
-		if exists[owner] {
-			continue
-		}
-		for _, job := range jobs {
-			cc.deleteJob(job, fmt.Sprintf("its cronjob %q is gone", job.OwnerName()))
-		}
-	}
 }
 
 // reconcile creates a Job if the CronJob is due, and deletes old finished Jobs.

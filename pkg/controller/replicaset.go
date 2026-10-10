@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand/v2"
 	"sort"
@@ -47,7 +46,7 @@ func (rc *ReplicaSetController) Run(ctx context.Context) {
 }
 
 // reconcileAll compares every ReplicaSet with its pods and fixes any
-// difference. It also removes pods whose ReplicaSet no longer exists.
+// difference.
 func (rc *ReplicaSetController) reconcileAll() {
 	rc.expected.check() // before reading: see expectations.go
 	sets, err := list(rc.Informers.replicaSets(), rc.Client.ListReplicaSets)
@@ -85,14 +84,6 @@ func (rc *ReplicaSetController) reconcileAll() {
 		}
 	}
 
-	for owner, pods := range owned {
-		if exists[owner] {
-			continue
-		}
-		for _, pod := range pods {
-			rc.deletePod(pod, fmt.Sprintf("its replicaset %q is gone", pod.OwnerName()))
-		}
-	}
 }
 
 // reconcile makes one ReplicaSet's pods match the number of replicas it wants.
@@ -103,6 +94,9 @@ func (rc *ReplicaSetController) reconcile(rs api.ReplicaSet, pods []api.Pod) {
 
 	var alive []api.Pod
 	for _, pod := range pods {
+		if pod.Terminating() {
+			continue // on its way out: neither counted nor deleted again
+		}
 		if isAlive(pod) {
 			alive = append(alive, pod)
 		} else {

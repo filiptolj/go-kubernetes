@@ -125,6 +125,11 @@ func TestAPI(t *testing.T) {
 		{"POST", "/apis/networking.k8s.io/v1/namespaces/default/ingresses", `{"metadata":{"name":"bad"},"spec":{"rules":[]}}`, http.StatusBadRequest},
 		{"GET", "/apis/networking.k8s.io/v1/ingresses", "", http.StatusOK},
 
+		// Autoscalers
+		{"POST", "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers", `{"metadata":{"name":"web"},"spec":{"scaleTargetRef":{"kind":"Deployment","name":"web"},"maxReplicas":5,"metrics":[{"type":"Resource","resource":{"name":"cpu","target":{"type":"Utilization","averageUtilization":50}}}]}}`, http.StatusCreated},
+		{"POST", "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers", `{"metadata":{"name":"bad"},"spec":{"scaleTargetRef":{"kind":"Deployment","name":"web"},"maxReplicas":5,"metrics":[]}}`, http.StatusBadRequest},
+		{"POST", "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers", `{"metadata":{"name":"bad"},"spec":{"scaleTargetRef":{"kind":"Pod","name":"web"},"maxReplicas":5}}`, http.StatusBadRequest},
+
 		// ReplicaSets
 		{"POST", apps + "/replicasets", `{"metadata":{"name":"web"},"spec":{"replicas":2,` + template + `}}`, http.StatusCreated},
 		{"POST", apps + "/replicasets", `{"metadata":{"name":"bad"},"spec":{"replicas":-1,"template":{"spec":{"containers":[{"name":"c"}]}}}}`, http.StatusBadRequest},
@@ -156,8 +161,12 @@ func TestAPI(t *testing.T) {
 		{"POST", core + "/events", `{"type":"Normal","reason":"Scheduled"}`, http.StatusBadRequest},
 		{"GET", core + "/events?namespace=default&kind=Pod&name=nginx", "", http.StatusOK},
 
-		// Deleting
+		// Deleting: nginx runs on a node, so it only starts terminating
 		{"DELETE", dflt + "/pods/nginx", "", http.StatusOK},
+		{"GET", dflt + "/pods/nginx", "", http.StatusOK},
+		{"DELETE", dflt + "/pods/nginx", "", http.StatusOK}, // still terminating
+		{"DELETE", dflt + "/pods/nginx?gracePeriodSeconds=x", "", http.StatusBadRequest},
+		{"DELETE", dflt + "/pods/nginx?gracePeriodSeconds=0", "", http.StatusOK}, // gone at once
 		{"DELETE", dflt + "/pods/nginx", "", http.StatusNotFound},
 
 		// Wrong method on a known path

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 )
@@ -26,8 +27,9 @@ type Runtime interface {
 	// Start starts one container of a pod and returns at once.
 	Start(pod api.Pod, c api.Container, opts Options) (Running, error)
 
-	// Stop kills a container that Start started.
-	Stop(pod api.Pod, c api.Container) error
+	// Stop stops a container that Start started: it asks the container to
+	// stop with SIGTERM, gives it grace to exit, and then kills it.
+	Stop(pod api.Pod, c api.Container, grace time.Duration) error
 
 	// Exec runs a command inside a running container, with stdin (if not
 	// nil) as its input and its output written to out, and returns its
@@ -37,6 +39,10 @@ type Runtime interface {
 	// RemoveAll removes every container left over from an earlier run of
 	// this kubelet, for example one that crashed.
 	RemoveAll() error
+
+	// PodUsage measures how much CPU and memory each pod's containers use
+	// right now, by the pod's "namespace/name".
+	PodUsage(pods []api.Pod) (map[string]api.Resources, error)
 }
 
 // Options are what a container starts with, besides its image and command.

@@ -18,8 +18,11 @@ commands:
   get <resource> [name] [-l selector] [-o yaml|json|name] [-w for pods]
   apply -f <file or folder>          YAML or JSON, several objects per file
   create namespace <name>
-  delete <resource> <name>
+  delete <resource> <name> [--grace-period N | --now]
   scale replicaset|deployment|statefulset <name> <replicas>
+  rollout status|history|undo deployment <name>
+  autoscale deployment <name> [-min 1] -max <n> [-cpu-percent 80]
+  top pods|nodes
   describe <resource> <name>
   logs <pod> [-c container] [-f]
   exec <pod> [-c container] [-i] -- <command> [args...]
@@ -27,7 +30,8 @@ commands:
   version
 
 resources: pods, nodes, replicasets, deployments, statefulsets, daemonsets,
-jobs, cronjobs, services, ingresses, configmaps, secrets, events, namespaces
+jobs, cronjobs, horizontalpodautoscalers (hpa), services, ingresses, configmaps,
+secrets, leases, events, namespaces
 
 -n picks the namespace (default "default"); -A means every namespace.
 Both can go anywhere after the command.`
@@ -142,9 +146,25 @@ func (c *cli) run(args []string) error {
 
 	case "delete":
 		if len(args) < 3 {
-			return errors.New("usage: minikubectl delete <resource> <name>")
+			return errors.New("usage: minikubectl delete <resource> <name> [--grace-period N | --now]")
 		}
-		return c.delete(args[1], args[2])
+		grace := -1 // the pod's own grace period
+		for i := 3; i < len(args); i++ {
+			switch {
+			case args[i] == "--now":
+				grace = 0
+			case args[i] == "--grace-period" && i+1 < len(args):
+				i++
+				n, err := strconv.Atoi(args[i])
+				if err != nil || n < 0 {
+					return fmt.Errorf("--grace-period must be a whole number of seconds, not %q", args[i])
+				}
+				grace = n
+			default:
+				return fmt.Errorf("unknown option %q for delete", args[i])
+			}
+		}
+		return c.delete(args[1], args[2], grace)
 
 	case "scale":
 		if len(args) < 4 || !(isReplicaSet(args[1]) || isDeployment(args[1]) || isStatefulSet(args[1])) {
@@ -167,6 +187,15 @@ func (c *cli) run(args []string) error {
 
 	case "exec":
 		return c.exec(args[1:])
+
+	case "rollout":
+		return c.rollout(args[1:])
+
+	case "autoscale":
+		return c.autoscale(args[1:])
+
+	case "top":
+		return c.top(args[1:])
 
 	case "port-forward":
 		return c.portForward(args[1:])

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 )
@@ -66,13 +67,29 @@ func (s *server) handleGetPod(w http.ResponseWriter, r *http.Request) {
 
 // handleDeletePod removes a pod. Its kubelet sees the DELETED event and stops it.
 func (s *server) handleDeletePod(w http.ResponseWriter, r *http.Request) {
-	pod, err := s.store.DeletePod(r.PathValue("namespace"), r.PathValue("name"))
+	// ?gracePeriodSeconds=N: how long the containers get to stop; 0 deletes
+	// the pod at once. Without it, the pod's own grace period applies.
+	grace := -1
+	if text := r.URL.Query().Get("gracePeriodSeconds"); text != "" {
+		n, err := strconv.Atoi(text)
+		if err != nil || n < 0 {
+			http.Error(w, "gracePeriodSeconds must be a whole number, 0 or more", http.StatusBadRequest)
+			return
+		}
+		grace = n
+	}
+
+	pod, removed, err := s.store.DeletePodGracefully(r.PathValue("namespace"), r.PathValue("name"), grace)
 	if err != nil {
 		http.Error(w, err.Error(), statusForError(err))
 		return
 	}
 
-	log.Printf("deleted pod %s", api.Key(pod.Namespace, pod.Name))
+	if removed {
+		log.Printf("deleted pod %s", api.Key(pod.Namespace, pod.Name))
+	} else {
+		log.Printf("pod %s is terminating: its containers get %ds to stop", api.Key(pod.Namespace, pod.Name), *pod.DeletionGracePeriodSeconds)
+	}
 	writeJSON(w, http.StatusOK, pod)
 }
 

@@ -32,6 +32,11 @@ type ObjectMeta struct {
 	Namespace string `json:"namespace,omitempty"`
 	Labels    Labels `json:"labels,omitempty"`
 
+	// Annotations are notes about an object, for programs and people, such
+	// as the revision of a Deployment's ReplicaSet. Unlike labels, nothing
+	// selects objects by them.
+	Annotations map[string]string `json:"annotations,omitempty"`
+
 	// The fields below are set by the API server.
 
 	// UID tells objects with the same name apart: an object that is deleted
@@ -49,6 +54,26 @@ type ObjectMeta struct {
 	// OwnerReferences lists the object that created this one, such as the
 	// ReplicaSet that created a pod.
 	OwnerReferences []OwnerReference `json:"ownerReferences,omitempty"`
+
+	// Finalizers name the work still to do before the object may go away.
+	// Deleting an object with finalizers only marks it: it stays, with a
+	// DeletionTimestamp, until whoever does the work removes its finalizer
+	// and the list is empty.
+	Finalizers []string `json:"finalizers,omitempty"`
+
+	// DeletionTimestamp is when the object was asked to be deleted, if it
+	// was, but it is still here: it has finalizers, or it is a pod whose
+	// containers are being given time to stop. Such an object is
+	// "Terminating". DeletionGracePeriodSeconds is how long a pod's
+	// containers get.
+	DeletionTimestamp          *time.Time `json:"deletionTimestamp,omitempty"`
+	DeletionGracePeriodSeconds *int       `json:"deletionGracePeriodSeconds,omitempty"`
+}
+
+// Terminating reports whether the object has been asked to be deleted, but
+// is still here.
+func (m ObjectMeta) Terminating() bool {
+	return m.DeletionTimestamp != nil
 }
 
 // OwnerReference points at the object that created another one, in the same
@@ -148,6 +173,11 @@ type PodSpec struct {
 	Containers    []Container   `json:"containers"`
 	Volumes       []Volume      `json:"volumes,omitempty"`
 	RestartPolicy RestartPolicy `json:"restartPolicy,omitempty"`
+
+	// TerminationGracePeriodSeconds is how long the pod's containers get to
+	// stop on their own, after SIGTERM, when the pod is deleted, before they
+	// are killed. Default 30.
+	TerminationGracePeriodSeconds *int `json:"terminationGracePeriodSeconds,omitempty"`
 
 	// NodeName is the node the pod runs on. The scheduler sets it.
 	NodeName string `json:"nodeName,omitempty"`
@@ -445,7 +475,9 @@ var apiVersions = map[string]string{
 	"Pod": "v1", "Node": "v1", "Namespace": "v1", "Service": "v1", "ConfigMap": "v1", "Secret": "v1",
 	"ReplicaSet": "apps/v1", "Deployment": "apps/v1", "StatefulSet": "apps/v1", "DaemonSet": "apps/v1",
 	"Job": "batch/v1", "CronJob": "batch/v1",
-	"Ingress": "networking.k8s.io/v1",
+	"Ingress":                 "networking.k8s.io/v1",
+	"HorizontalPodAutoscaler": "autoscaling/v2",
+	"Lease":                   "coordination.k8s.io/v1",
 }
 
 // kindsByPlural maps the plural used in URLs to its kind.
@@ -454,6 +486,7 @@ var kindsByPlural = map[string]string{
 	"configmaps": "ConfigMap", "secrets": "Secret", "events": "Event",
 	"replicasets": "ReplicaSet", "deployments": "Deployment", "statefulsets": "StatefulSet", "daemonsets": "DaemonSet",
 	"jobs": "Job", "cronjobs": "CronJob", "ingresses": "Ingress",
+	"horizontalpodautoscalers": "HorizontalPodAutoscaler", "leases": "Lease",
 }
 
 // APIVersion returns the API version of a kind, such as "apps/v1" for
@@ -478,4 +511,17 @@ func Prefix(plural string) string {
 		return "/api/" + version
 	}
 	return "/apis/" + version
+}
+
+// DefaultTerminationGracePeriod is how long a deleted pod's containers get
+// to stop, in seconds, if the pod doesn't say.
+const DefaultTerminationGracePeriod = 30
+
+// GracePeriod returns how long a deleted pod's containers get to stop, in
+// seconds.
+func (spec PodSpec) GracePeriod() int {
+	if spec.TerminationGracePeriodSeconds != nil {
+		return *spec.TerminationGracePeriodSeconds
+	}
+	return DefaultTerminationGracePeriod
 }

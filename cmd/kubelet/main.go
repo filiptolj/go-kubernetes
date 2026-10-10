@@ -44,14 +44,13 @@ func main() {
 	defer cancel()
 
 	k := kubelet.New(kubelet.Config{
-		NodeName:    *nodeName,
-		CPU:         *cpu,
-		Memory:      *memory,
-		LogDir:      *logDir,
-		Heartbeat:   5 * time.Second,
-		ListenAddr:  fmt.Sprintf(":%d", *port),
-		GracePeriod: 2 * time.Second,
-		VolumeDir:   *volumeDir,
+		NodeName:   *nodeName,
+		CPU:        *cpu,
+		Memory:     *memory,
+		LogDir:     *logDir,
+		Heartbeat:  5 * time.Second,
+		ListenAddr: fmt.Sprintf(":%d", *port),
+		VolumeDir:  *volumeDir,
 	}, client.New(*server), rt)
 
 	log.Printf("kubelet for node %q started (runtime: %s, logs in %s)", *nodeName, *runtimeName, *logDir)

@@ -34,11 +34,6 @@ type Config struct {
 	// Empty means don't serve them.
 	ListenAddr string
 
-	// GracePeriod is how long a deleted pod keeps running before it is
-	// stopped. It gives the proxy time to stop sending it new connections,
-	// and lets requests already in progress finish.
-	GracePeriod time.Duration
-
 	// A container that exits is restarted after RestartDelay. While it keeps
 	// crashing, the delay doubles each time, up to MaxRestartDelay. Once a
 	// container has run for HealthyAfter, the delay starts over.
@@ -49,6 +44,9 @@ type Config struct {
 	// Resync is how often to look at every pod again, in case a watch event
 	// was missed or a pod is waiting for an older one with the same name.
 	Resync time.Duration
+
+	// MetricsEvery is how often to measure what the pods use, for /stats.
+	MetricsEvery time.Duration
 }
 
 // Kubelet runs the pods bound to one node.
@@ -61,6 +59,10 @@ type Kubelet struct {
 
 	mu   sync.Mutex
 	pods map[string]*runningPod // pods this kubelet runs, by "namespace/name"
+
+	metricsMu  sync.Mutex
+	metrics    []api.PodMetrics // what the pods used at the last measurement
+	metricsErr error            // why the last measurement failed, if it did
 }
 
 // New returns a Kubelet that talks to the API server through c and runs
@@ -73,6 +75,7 @@ func New(cfg Config, c *client.Client, rt cri.Runtime) *Kubelet {
 	setDefault(&cfg.MaxRestartDelay, 5*time.Minute)
 	setDefault(&cfg.HealthyAfter, time.Minute)
 	setDefault(&cfg.Resync, 10*time.Second)
+	setDefault(&cfg.MetricsEvery, 15*time.Second)
 	if cfg.VolumeDir == "" {
 		cfg.VolumeDir = filepath.Join(os.TempDir(), "minik8s", "volumes", cfg.NodeName)
 	}
@@ -135,6 +138,7 @@ func (k *Kubelet) Run(ctx context.Context) error {
 		defer close(heartbeatDone)
 		k.heartbeatLoop(ctx)
 	}()
+	go k.measureLoop(ctx)
 
 	client.Retry(ctx, "watch pods", func() error {
 		return k.sync(ctx)
@@ -171,7 +175,12 @@ func (k *Kubelet) sync(ctx context.Context) error {
 				return errors.New("lost connection to the API server")
 			}
 			if event.Type == api.EventDeleted {
-				k.stopPodLater(event.Object)
+				// Normally the pod went through terminate first and is
+				// already stopped. If someone deleted it at once, stop it now.
+				go func() {
+					k.stopPod(event.Object, 0)
+					k.removeLogs(event.Object)
+				}()
 				continue
 			}
 			k.handle(event.Object)
@@ -229,8 +238,13 @@ func (k *Kubelet) recover(pod api.Pod) {
 	}
 }
 
-// handle starts a pod if it is bound to this node and still waiting to run.
+// handle starts a pod if it is bound to this node and still waiting to run,
+// and stops one that is being deleted.
 func (k *Kubelet) handle(pod api.Pod) {
+	if pod.NodeName == k.cfg.NodeName && pod.Terminating() {
+		k.terminate(pod)
+		return
+	}
 	if pod.NodeName != k.cfg.NodeName || pod.Phase != api.PodPending {
 		return
 	}
@@ -247,7 +261,7 @@ func (k *Kubelet) handle(pod api.Pod) {
 		// or because we missed its deletion. Make sure it's on its way out;
 		// the new one starts on a later resync, once the old one is gone.
 		k.mu.Unlock()
-		k.stopPod(old.pod)
+		k.stopPod(old.pod, 0)
 		return
 	}
 
@@ -259,28 +273,48 @@ func (k *Kubelet) handle(pod api.Pod) {
 	k.startPod(ctx, rp)
 }
 
-// stopPodLater stops a deleted pod once the grace period is over, and
-// removes its logs. A pod that had already finished only has logs to remove.
-func (k *Kubelet) stopPodLater(pod api.Pod) {
-	stop := func() {
-		k.stopPod(pod)
-		k.removeLogs(pod)
+// terminate carries out the graceful deletion of a pod on this node: it
+// stops the pod's containers, giving them the pod's grace period to exit
+// after SIGTERM, and then deletes the pod for good. Meanwhile the pod is
+// Terminating: Services already send it nothing, and its controller has
+// already started a replacement.
+func (k *Kubelet) terminate(pod api.Pod) {
+	key := api.Key(pod.Namespace, pod.Name)
+
+	k.mu.Lock()
+	rp, ok := k.pods[key]
+	running := ok && rp.pod.UID == pod.UID
+	if running && rp.terminating {
+		k.mu.Unlock()
+		return // already on it
+	}
+	if running {
+		rp.terminating = true
+	}
+	k.mu.Unlock()
+
+	grace := time.Duration(pod.GracePeriod()) * time.Second
+	if pod.DeletionGracePeriodSeconds != nil {
+		grace = time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second
 	}
 
-	if k.cfg.GracePeriod == 0 {
-		stop()
-		return
-	}
-
-	// time.AfterFunc runs the function in its own goroutine once the time is
-	// up. Meanwhile the kubelet carries on handling other pods.
-	time.AfterFunc(k.cfg.GracePeriod, stop)
+	go func() {
+		if running {
+			log.Printf("pod %s is being deleted: stopping it, with %s to exit", key, grace)
+			k.stopPod(pod, grace)
+		}
+		err := k.client.DeletePodWithGrace(pod.Namespace, pod.Name, 0)
+		if err != nil && !errors.Is(err, client.ErrNotFound) {
+			log.Printf("could not delete pod %s: %v", key, err)
+		}
+	}()
 }
 
-// stopPod stops a pod this kubelet runs, and forgets it. Only the exact
-// pod, with the same UID, is stopped: a newer pod with the same name is left
+// stopPod stops a pod this kubelet runs, and forgets it. Its containers get
+// grace to exit after SIGTERM before they are killed. Only the exact pod,
+// with the same UID, is stopped: a newer pod with the same name is left
 // alone. It returns false if the pod isn't running here.
-func (k *Kubelet) stopPod(pod api.Pod) bool {
+func (k *Kubelet) stopPod(pod api.Pod, grace time.Duration) bool {
 	key := api.Key(pod.Namespace, pod.Name)
 
 	k.mu.Lock()
@@ -296,12 +330,16 @@ func (k *Kubelet) stopPod(pod api.Pod) bool {
 	k.events.Normal("Pod", pod.Namespace, pod.Name, "Killing", "stopping the pod's containers")
 
 	rp.cancel() // the container loops stop restarting
+	var stops sync.WaitGroup
 	for _, c := range slices.Concat(rp.pod.InitContainers, rp.pod.Containers) {
-		err := k.runtime.Stop(rp.pod, c)
-		if err != nil {
-			log.Printf("pod %s: %v", key, err)
-		}
+		stops.Go(func() { // all at once, so the grace period isn't added up
+			err := k.runtime.Stop(rp.pod, c, grace)
+			if err != nil {
+				log.Printf("pod %s: %v", key, err)
+			}
+		})
 	}
+	stops.Wait()
 	rp.wg.Wait() // until every container loop has finished
 	k.removeSandbox(rp)
 	k.removeVolumes(rp.pod)
@@ -327,7 +365,7 @@ func (k *Kubelet) shutdown() {
 	var wg sync.WaitGroup
 	for _, pod := range running {
 		wg.Go(func() {
-			if k.stopPod(pod) {
+			if k.stopPod(pod, 0) {
 				err := k.client.SetPodPhase(pod.Namespace, pod.Name, api.PodFailed)
 				if err != nil {
 					log.Printf("could not report pod %s as Failed: %v", api.Key(pod.Namespace, pod.Name), err)

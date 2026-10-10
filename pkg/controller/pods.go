@@ -45,5 +45,5 @@ func groupByOwner(pods []api.Pod, kind string) map[string][]api.Pod {
 
 // isRunningAndReady reports whether a pod runs and is ready for traffic.
 func isRunningAndReady(pod api.Pod) bool {
-	return pod.Phase == api.PodRunning && pod.Ready
+	return pod.Phase == api.PodRunning && pod.Ready && !pod.Terminating()
 }

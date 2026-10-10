@@ -44,6 +44,16 @@ func (c *Client) Secrets() *Resource[api.Secret] {
 	return &Resource[api.Secret]{c, "secrets", "secret"}
 }
 
+// Autoscalers returns a client for HorizontalPodAutoscalers.
+func (c *Client) Autoscalers() *Resource[api.HorizontalPodAutoscaler] {
+	return &Resource[api.HorizontalPodAutoscaler]{c, "horizontalpodautoscalers", "horizontalpodautoscaler"}
+}
+
+// Leases returns a client for Leases.
+func (c *Client) Leases() *Resource[api.Lease] {
+	return &Resource[api.Lease]{c, "leases", "lease"}
+}
+
 // Ingresses returns a client for Ingresses.
 func (c *Client) Ingresses() *Resource[api.Ingress] {
 	return &Resource[api.Ingress]{c, "ingresses", "ingress"}

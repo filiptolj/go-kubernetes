@@ -288,6 +288,24 @@ func prepareService(svc *api.Service) error {
 	return nil
 }
 
+// prepareAutoscaler checks a HorizontalPodAutoscaler.
+func prepareAutoscaler(h *api.HorizontalPodAutoscaler) error {
+	ref := h.ScaleTargetRef
+	switch {
+	case ref.Kind != "Deployment" && ref.Kind != "ReplicaSet":
+		return fmt.Errorf("scaleTargetRef: can scale a Deployment or a ReplicaSet, not %q", ref.Kind)
+	case ref.Name == "":
+		return errors.New("scaleTargetRef needs a name")
+	case h.Min() < 1:
+		return errors.New("minReplicas must be at least 1")
+	case h.MaxReplicas < h.Min():
+		return fmt.Errorf("maxReplicas (%d) can't be less than minReplicas (%d)", h.MaxReplicas, h.Min())
+	case h.TargetCPU() <= 0:
+		return errors.New(`metrics needs a cpu target: [{type: Resource, resource: {name: cpu, target: {type: Utilization, averageUtilization: 50}}}]`)
+	}
+	return nil
+}
+
 // prepareIngress checks an Ingress's rules, and makes "Prefix" the default
 // path type.
 func prepareIngress(ing *api.Ingress) error {

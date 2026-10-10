@@ -142,7 +142,9 @@ func (p *Proxy) sync() {
 func endpointsFor(svc api.Service, port api.ServicePort, pods []api.Pod, podIPs bool) []endpoint {
 	var endpoints []endpoint
 	for _, pod := range pods {
-		if pod.Namespace != svc.Namespace || pod.Phase != api.PodRunning || !pod.Ready || !pod.Labels.Matches(svc.Selector) {
+		// A Terminating pod gets no new connections: it is about to stop.
+		if pod.Namespace != svc.Namespace || pod.Phase != api.PodRunning || !pod.Ready || pod.Terminating() ||
+			!pod.Labels.Matches(svc.Selector) {
 			continue
 		}
 		address := pod.HostPorts[port.Target()]

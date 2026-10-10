@@ -30,13 +30,26 @@ const ns = api.DefaultNamespace
 // "container" exits, and with what result, by calling exit.
 type fakeRuntime struct {
 	mu        sync.Mutex
-	running   map[string]chan error  // by "pod/container"
-	starts    map[string]int         // how often each container was started
-	options   map[string]cri.Options // what each container last started with
-	addresses map[string]string      // address to report, by pod; "fake:<pod>" if not set
-	execCodes map[string]int         // exit code of commands run with Exec, by "pod/container"
-	execs     []string               // every command run with Exec
-	sandboxes map[string]bool        // pods with a sandbox right now
+	running   map[string]chan error    // by "pod/container"
+	starts    map[string]int           // how often each container was started
+	options   map[string]cri.Options   // what each container last started with
+	addresses map[string]string        // address to report, by pod; "fake:<pod>" if not set
+	execCodes map[string]int           // exit code of commands run with Exec, by "pod/container"
+	execs     []string                 // every command run with Exec
+	sandboxes map[string]bool          // pods with a sandbox right now
+	graces    map[string]time.Duration // the grace each container was last stopped with
+	usage     map[string]api.Resources // what PodUsage reports, by "namespace/pod"
+}
+
+// PodUsage reports what the test set in f.usage.
+func (f *fakeRuntime) PodUsage(pods []api.Pod) (map[string]api.Resources, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	usage := make(map[string]api.Resources)
+	for _, pod := range pods {
+		usage[api.Key(pod.Namespace, pod.Name)] = f.usage[api.Key(pod.Namespace, pod.Name)]
+	}
+	return usage, nil
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -47,6 +60,8 @@ func newFakeRuntime() *fakeRuntime {
 		addresses: make(map[string]string),
 		execCodes: make(map[string]int),
 		sandboxes: make(map[string]bool),
+		graces:    make(map[string]time.Duration),
+		usage:     make(map[string]api.Resources),
 	}
 }
 
@@ -117,9 +132,19 @@ func (f *fakeRuntime) Start(pod api.Pod, c api.Container, opts cri.Options) (cri
 	return running, nil
 }
 
-func (f *fakeRuntime) Stop(pod api.Pod, c api.Container) error {
+func (f *fakeRuntime) Stop(pod api.Pod, c api.Container, grace time.Duration) error {
+	f.mu.Lock()
+	f.graces[pod.Name+"/"+c.Name] = grace
+	f.mu.Unlock()
 	f.exit(pod.Name+"/"+c.Name, errors.New("signal: killed"))
 	return nil
+}
+
+// grace returns the grace period a container was last stopped with.
+func (f *fakeRuntime) grace(key string) time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.graces[key]
 }
 
 func (f *fakeRuntime) RemoveAll() error {
@@ -217,6 +242,7 @@ func startNode(t *testing.T) *testNode {
 		MaxRestartDelay: 100 * time.Millisecond,
 		HealthyAfter:    time.Hour,
 		Resync:          50 * time.Millisecond,
+		MetricsEvery:    50 * time.Millisecond,
 	}
 	k := New(n.cfg, client.New(ts.URL), n.rt)
 
@@ -611,6 +637,47 @@ func TestDeletedPodIsStopped(t *testing.T) {
 	n.st.DeletePod(ns, "doomed")
 	waitFor(t, "the container to be stopped", func() bool { return !n.rt.isRunning("doomed/main") })
 	waitFor(t, "the sandbox to be removed", func() bool { return !n.rt.hasSandbox("doomed") })
+}
+
+func TestGracefulDeletion(t *testing.T) {
+	n := startNode(t)
+	n.run("app", nil)
+	waitFor(t, "the container to run", func() bool { return n.rt.isRunning("app/main") })
+
+	// What the API server does on DELETE: mark the pod, with a grace period.
+	pod, removed, err := n.st.DeletePodGracefully(ns, "app", 7)
+	if err != nil || removed || !pod.Terminating() {
+		t.Fatalf("got pod %+v, removed %t, %v; want it marked Terminating", pod.ObjectMeta, removed, err)
+	}
+
+	// The kubelet stops the containers with that grace, then deletes the pod.
+	waitFor(t, "the pod to be deleted for good", func() bool {
+		_, ok := n.st.GetPod(ns, "app")
+		return !ok
+	})
+	if n.rt.isRunning("app/main") {
+		t.Error("the container still runs")
+	}
+	if g := n.rt.grace("app/main"); g != 7*time.Second {
+		t.Errorf("the container was stopped with grace %s, want 7s", g)
+	}
+}
+
+func TestStats(t *testing.T) {
+	n := startNode(t)
+	n.run("busy", nil)
+	n.waitPhase("busy", api.PodRunning)
+
+	n.rt.mu.Lock()
+	n.rt.usage[api.Key(ns, "busy")] = api.Resources{CPU: 250, Memory: 64 << 20}
+	n.rt.mu.Unlock()
+
+	address := n.st.ListNodes()[0].Address
+	waitFor(t, "the pod's usage in /stats", func() bool {
+		metrics, err := client.GetPodMetrics(address)
+		return err == nil && len(metrics) == 1 && metrics[0].Name == "busy" &&
+			metrics[0].Usage["cpu"] == "250m" && metrics[0].Usage["memory"] == "64Mi"
+	})
 }
 
 func TestPodIPAndSandbox(t *testing.T) {

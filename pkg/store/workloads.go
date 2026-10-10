@@ -56,6 +56,29 @@ func (s *Store) UpdateDeployment(d api.Deployment) error {
 	return nil
 }
 
+// UpdateReplicaSet replaces an existing ReplicaSet.
+func (s *Store) UpdateReplicaSet(rs api.ReplicaSet) (api.ReplicaSet, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := api.Key(rs.Namespace, rs.Name)
+	stored, ok := s.replicaSets[key]
+	if !ok {
+		return api.ReplicaSet{}, fmt.Errorf("replicaset %q in namespace %q: %w", rs.Name, rs.Namespace, ErrNotFound)
+	}
+
+	err := s.stampUpdate(&rs.ObjectMeta, stored.ObjectMeta)
+	if err != nil {
+		return api.ReplicaSet{}, fmt.Errorf("replicaset %q: %w", rs.Name, err)
+	}
+	err = s.put(api.EventModified, kindReplicaSets, key, rs)
+	if err != nil {
+		return api.ReplicaSet{}, err
+	}
+	s.replicaSets[key] = rs
+	return rs, nil
+}
+
 // ListDeployments returns the Deployments in a namespace, or in all
 // namespaces if namespace is "".
 func (s *Store) ListDeployments(namespace string) []api.Deployment {

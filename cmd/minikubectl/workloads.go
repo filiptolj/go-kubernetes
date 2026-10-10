@@ -22,6 +22,10 @@ func isStatefulSet(r string) bool { return r == "statefulsets" || r == "stateful
 func isConfigMap(r string) bool   { return r == "configmaps" || r == "configmap" || r == "cm" }
 func isSecret(r string) bool      { return r == "secrets" || r == "secret" }
 func isIngress(r string) bool     { return r == "ingresses" || r == "ingress" || r == "ing" }
+func isLease(r string) bool       { return r == "leases" || r == "lease" }
+func isAutoscaler(r string) bool {
+	return r == "horizontalpodautoscalers" || r == "horizontalpodautoscaler" || r == "hpa"
+}
 
 // applyResource reads an object of a newer kind from a file's data, puts it
 // in namespace, and creates it, or updates it if it already exists.
@@ -72,6 +76,8 @@ func (c *cli) applyWorkload(kind string, data []byte, namespace string) (bool, e
 		return true, applyResource(c.client.Secrets(), "secret", data, namespace)
 	case "Ingress":
 		return true, applyResource(c.client.Ingresses(), "ingress", data, namespace)
+	case "HorizontalPodAutoscaler":
+		return true, applyResource(c.client.Autoscalers(), "horizontalpodautoscaler", data, namespace)
 	}
 	return false, nil
 }
@@ -95,6 +101,8 @@ func (c *cli) deleteWorkload(resource, name string) (bool, error) {
 		err, resource = c.client.Secrets().Delete(c.namespace, name), "secret"
 	case isIngress(resource):
 		err, resource = c.client.Ingresses().Delete(c.namespace, name), "ingress"
+	case isAutoscaler(resource):
+		err, resource = c.client.Autoscalers().Delete(c.namespace, name), "horizontalpodautoscaler"
 	default:
 		return false, nil
 	}
@@ -123,8 +131,47 @@ func (c *cli) getWorkload(resource string) (bool, error) {
 		return true, getData(c, list[api.Secret], "secrets", func(s api.Secret) (api.ObjectMeta, int) { return s.ObjectMeta, len(s.Data) })
 	case isIngress(resource):
 		return true, c.getIngresses()
+	case isAutoscaler(resource):
+		return true, c.getAutoscalers()
+	case isLease(resource):
+		return true, c.getLeases()
 	}
 	return false, nil
+}
+
+func (c *cli) getLeases() error {
+	leases, err := list[api.Lease](c, "leases")
+	if err != nil {
+		return err
+	}
+
+	w := c.newTable("NAME\tHOLDER\tRENEWED")
+	for _, l := range leases {
+		renewed := "<never>"
+		if !l.RenewTime.IsZero() {
+			renewed = age(l.RenewTime) + " ago"
+		}
+		c.row(w, l.Namespace, l.Name, orNone(l.HolderIdentity), renewed)
+	}
+	return w.Flush()
+}
+
+func (c *cli) getAutoscalers() error {
+	autoscalers, err := list[api.HorizontalPodAutoscaler](c, "horizontalpodautoscalers")
+	if err != nil {
+		return err
+	}
+
+	w := c.newTable("NAME\tREFERENCE\tCPU\tMIN\tMAX\tREPLICAS")
+	for _, h := range autoscalers {
+		cpu := "<unknown>"
+		if u := h.Status.CurrentCPUUtilization; u != nil {
+			cpu = fmt.Sprint(*u) + "%"
+		}
+		c.row(w, h.Namespace, h.Name, h.ScaleTargetRef.Kind+"/"+h.ScaleTargetRef.Name,
+			fmt.Sprintf("%s/%d%%", cpu, h.TargetCPU()), h.Min(), h.MaxReplicas, h.Status.CurrentReplicas)
+	}
+	return w.Flush()
 }
 
 func (c *cli) getIngresses() error {
@@ -281,6 +328,8 @@ func (c *cli) describeWorkload(resource, name string) (bool, error) {
 		return true, c.describeDaemonSet(name)
 	case isStatefulSet(resource):
 		return true, c.describeStatefulSet(name)
+	case isAutoscaler(resource):
+		return true, c.describeAutoscaler(name)
 	case isConfigMap(resource):
 		cm, err := c.client.ConfigMaps().Get(c.namespace, name)
 		if err != nil {
@@ -307,6 +356,25 @@ func (c *cli) describeWorkload(resource, name string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+func (c *cli) describeAutoscaler(name string) error {
+	h, err := c.client.Autoscalers().Get(c.namespace, name)
+	if err != nil {
+		return err
+	}
+
+	cpu := "<unknown>"
+	if u := h.Status.CurrentCPUUtilization; u != nil {
+		cpu = fmt.Sprintf("%d%%", *u)
+	}
+	field("Name", h.Name)
+	field("Namespace", h.Namespace)
+	field("Scales", h.ScaleTargetRef.Kind+"/"+h.ScaleTargetRef.Name)
+	field("Replicas", fmt.Sprintf("%d to %d; now %d, wants %d", h.Min(), h.MaxReplicas, h.Status.CurrentReplicas, h.Status.DesiredReplicas))
+	field("CPU", fmt.Sprintf("%s of request, target %d%%", cpu, h.TargetCPU()))
+	field("Last scaled", formatTime(h.Status.LastScaleTime))
+	return c.printEvents("HorizontalPodAutoscaler", h.Namespace, h.Name)
 }
 
 func (c *cli) describeJob(name string) error {
@@ -425,6 +493,9 @@ func (c *cli) printOwnedPods(kind, owner string) error {
 // podStatus is what the STATUS column shows: a problem like
 // "CrashLoopBackOff" if there is one, or else the phase.
 func podStatus(pod api.Pod) string {
+	if pod.Terminating() {
+		return "Terminating"
+	}
 	if pod.Reason != "" {
 		return pod.Reason
 	}

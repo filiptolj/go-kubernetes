@@ -24,6 +24,7 @@ type Informers struct {
 	CronJobs     *client.Informer[api.CronJob]
 	DaemonSets   *client.Informer[api.DaemonSet]
 	StatefulSets *client.Informer[api.StatefulSet]
+	Autoscalers  *client.Informer[api.HorizontalPodAutoscaler]
 }
 
 // NewInformers returns an informer for every kind the controllers use.
@@ -37,6 +38,7 @@ func NewInformers(c *client.Client) *Informers {
 		CronJobs:     client.NewInformer[api.CronJob](c, "cronjobs"),
 		DaemonSets:   client.NewInformer[api.DaemonSet](c, "daemonsets"),
 		StatefulSets: client.NewInformer[api.StatefulSet](c, "statefulsets"),
+		Autoscalers:  client.NewInformer[api.HorizontalPodAutoscaler](c, "horizontalpodautoscalers"),
 	}
 }
 
@@ -51,6 +53,7 @@ func (inf *Informers) Run(ctx context.Context) {
 	wg.Go(func() { inf.CronJobs.Run(ctx) })
 	wg.Go(func() { inf.DaemonSets.Run(ctx) })
 	wg.Go(func() { inf.StatefulSets.Run(ctx) })
+	wg.Go(func() { inf.Autoscalers.Run(ctx) })
 	wg.Wait()
 }
 
@@ -104,6 +107,13 @@ func (inf *Informers) daemonSets() *client.Informer[api.DaemonSet] {
 		return nil
 	}
 	return inf.DaemonSets
+}
+
+func (inf *Informers) autoscalers() *client.Informer[api.HorizontalPodAutoscaler] {
+	if inf == nil {
+		return nil
+	}
+	return inf.Autoscalers
 }
 
 func (inf *Informers) statefulSets() *client.Informer[api.StatefulSet] {

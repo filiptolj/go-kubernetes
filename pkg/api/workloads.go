@@ -35,7 +35,15 @@ type Deployment struct {
 type DeploymentSpec struct {
 	Replicas int             `json:"replicas"`
 	Template PodTemplateSpec `json:"template"`
+
+	// RevisionHistoryLimit is how many old ReplicaSets to keep, scaled to
+	// 0, so `minikubectl rollout undo` can go back to them. Default 10.
+	RevisionHistoryLimit *int `json:"revisionHistoryLimit,omitempty"`
 }
+
+// RevisionAnnotation numbers the versions of a Deployment: each of its
+// ReplicaSets has a revision, and the newest one has the highest.
+const RevisionAnnotation = "deployment.kubernetes.io/revision"
 
 // StatefulSet runs numbered copies of a pod with stable names: web-0, web-1,
 // web-2. They are created one at a time, in order, each only once the one

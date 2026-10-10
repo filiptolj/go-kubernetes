@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,8 +78,21 @@ func (c *Client) CreatePod(pod api.Pod) error {
 }
 
 // DeletePod removes a pod.
+//
+// A pod that may be running is only marked for deletion: it is Terminating
+// while its kubelet gives its containers their grace period to stop.
 func (c *Client) DeletePod(namespace, name string) error {
-	err := c.send(http.MethodDelete, objectPath(namespace, "pods", name), nil, http.StatusOK)
+	return c.DeletePodWithGrace(namespace, name, -1)
+}
+
+// DeletePodWithGrace deletes a pod, giving its containers grace seconds to
+// stop: 0 deletes it at once, and below 0 means the pod's own grace period.
+func (c *Client) DeletePodWithGrace(namespace, name string, grace int) error {
+	path := objectPath(namespace, "pods", name)
+	if grace >= 0 {
+		path += "?gracePeriodSeconds=" + strconv.Itoa(grace)
+	}
+	err := c.send(http.MethodDelete, path, nil, http.StatusOK)
 	if err != nil {
 		return fmt.Errorf("delete pod %q: %w", name, err)
 	}

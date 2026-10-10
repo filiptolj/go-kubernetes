@@ -44,6 +44,8 @@ type Store struct {
 	ConfigMaps   *Resource[api.ConfigMap]
 	Secrets      *Resource[api.Secret]
 	Ingresses    *Resource[api.Ingress]
+	Autoscalers  *Resource[api.HorizontalPodAutoscaler]
+	Leases       *Resource[api.Lease]
 	resources    []resource
 
 	events      []api.Event
@@ -80,6 +82,8 @@ func New() *Store {
 	s.ConfigMaps = newResource[api.ConfigMap](s, "configMaps", "configmap")
 	s.Secrets = newResource[api.Secret](s, "secrets", "secret")
 	s.Ingresses = newResource[api.Ingress](s, "ingresses", "ingress")
+	s.Autoscalers = newResource[api.HorizontalPodAutoscaler](s, "horizontalPodAutoscalers", "horizontalpodautoscaler")
+	s.Leases = newResource[api.Lease](s, "leases", "lease")
 	return s
 }
 
@@ -285,6 +289,44 @@ func (s *Store) DeletePod(namespace, name string) (api.Pod, error) {
 }
 
 // deletePod removes a pod and tells watchers. The caller must hold s.mu.
+// DeletePodGracefully deletes a pod the way a client asks to: a pod that
+// may be running on a node is only marked for deletion, and its kubelet
+// gives its containers grace seconds to stop, then deletes it for good with
+// grace 0. A grace below 0 means the pod's own grace period. Asking again
+// with a shorter grace shortens it. removed says whether the pod is gone.
+func (s *Store) DeletePodGracefully(namespace, name string, grace int) (pod api.Pod, removed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := api.Key(namespace, name)
+	pod, ok := s.pods[key]
+	if !ok {
+		return api.Pod{}, false, fmt.Errorf("pod %q in namespace %q: %w", name, namespace, ErrNotFound)
+	}
+	if grace < 0 {
+		grace = pod.GracePeriod()
+	}
+
+	// Nothing runs for a pod that has no node yet, or has finished: it can
+	// go at once.
+	finished := pod.Phase == api.PodSucceeded || pod.Phase == api.PodFailed
+	if grace == 0 || pod.NodeName == "" || finished {
+		return pod, true, s.deletePod(key, pod)
+	}
+
+	if pod.Terminating() && *pod.DeletionGracePeriodSeconds <= grace {
+		return pod, false, nil // already terminating, at least as quickly
+	}
+	s.markForDeletion(&pod.ObjectMeta)
+	pod.DeletionGracePeriodSeconds = &grace
+	err = s.put(api.EventModified, kindPods, key, pod)
+	if err != nil {
+		return api.Pod{}, false, err
+	}
+	s.pods[key] = pod
+	return pod, false, nil
+}
+
 func (s *Store) deletePod(key string, pod api.Pod) error {
 	err := s.remove(kindPods, key, pod)
 	if err != nil {
