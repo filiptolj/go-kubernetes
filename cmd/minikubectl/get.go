@@ -74,9 +74,9 @@ func (c *cli) getPods(watch bool) error {
 		return err
 	}
 
-	w := c.newTable("NAME\tSTATUS\tREADY\tRESTARTS\tNODE\tADDRESS")
+	w := c.newTable("NAME\tSTATUS\tREADY\tRESTARTS\tNODE\tIP\tADDRESS")
 	for _, pod := range pods {
-		c.row(w, pod.Namespace, pod.Name, podStatus(pod), yesNo(pod.Ready), pod.Restarts, orNone(pod.NodeName), orNone(pod.Address))
+		c.row(w, pod.Namespace, pod.Name, podStatus(pod), yesNo(pod.Ready), pod.Restarts, orNone(pod.NodeName), orNone(pod.PodIP), orNone(pod.Address))
 	}
 	w.Flush()
 

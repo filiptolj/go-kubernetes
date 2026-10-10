@@ -119,6 +119,12 @@ func TestAPI(t *testing.T) {
 		{"DELETE", dflt + "/secrets/db", "", http.StatusOK},
 		{"DELETE", dflt + "/secrets/db", "", http.StatusNotFound},
 
+		// Ingresses
+		{"POST", "/apis/networking.k8s.io/v1/namespaces/default/ingresses", `{"metadata":{"name":"shop"},"spec":{"rules":[{"host":"shop.local","http":{"paths":[{"path":"/","backend":{"service":{"name":"web","port":{"number":8081}}}}]}}]}}`, http.StatusCreated},
+		{"POST", "/apis/networking.k8s.io/v1/namespaces/default/ingresses", `{"metadata":{"name":"bad"},"spec":{"rules":[{"http":{"paths":[{"path":"api","backend":{"service":{"name":"web","port":{"number":8081}}}}]}}]}}`, http.StatusBadRequest},
+		{"POST", "/apis/networking.k8s.io/v1/namespaces/default/ingresses", `{"metadata":{"name":"bad"},"spec":{"rules":[]}}`, http.StatusBadRequest},
+		{"GET", "/apis/networking.k8s.io/v1/ingresses", "", http.StatusOK},
+
 		// ReplicaSets
 		{"POST", apps + "/replicasets", `{"metadata":{"name":"web"},"spec":{"replicas":2,` + template + `}}`, http.StatusCreated},
 		{"POST", apps + "/replicasets", `{"metadata":{"name":"bad"},"spec":{"replicas":-1,"template":{"spec":{"containers":[{"name":"c"}]}}}}`, http.StatusBadRequest},

@@ -178,6 +178,11 @@ type PodStatus struct {
 	Address   string         `json:"address,omitempty"`
 	HostPorts map[int]string `json:"hostPorts,omitempty"`
 
+	// PodIP is the pod's own address on the cluster network, where other
+	// pods reach it. Every container of the pod shares it. Pods run by the
+	// process runtime have none.
+	PodIP string `json:"podIP,omitempty"`
+
 	// Restarts counts how often the kubelet has restarted the pod's containers.
 	Restarts int `json:"restarts,omitempty"`
 

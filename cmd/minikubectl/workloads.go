@@ -21,6 +21,7 @@ func isDaemonSet(r string) bool   { return r == "daemonsets" || r == "daemonset"
 func isStatefulSet(r string) bool { return r == "statefulsets" || r == "statefulset" || r == "sts" }
 func isConfigMap(r string) bool   { return r == "configmaps" || r == "configmap" || r == "cm" }
 func isSecret(r string) bool      { return r == "secrets" || r == "secret" }
+func isIngress(r string) bool     { return r == "ingresses" || r == "ingress" || r == "ing" }
 
 // applyResource reads an object of a newer kind from a file's data, puts it
 // in namespace, and creates it, or updates it if it already exists.
@@ -69,6 +70,8 @@ func (c *cli) applyWorkload(kind string, data []byte, namespace string) (bool, e
 		return true, applyResource(c.client.ConfigMaps(), "configmap", data, namespace)
 	case "Secret":
 		return true, applyResource(c.client.Secrets(), "secret", data, namespace)
+	case "Ingress":
+		return true, applyResource(c.client.Ingresses(), "ingress", data, namespace)
 	}
 	return false, nil
 }
@@ -90,6 +93,8 @@ func (c *cli) deleteWorkload(resource, name string) (bool, error) {
 		err, resource = c.client.ConfigMaps().Delete(c.namespace, name), "configmap"
 	case isSecret(resource):
 		err, resource = c.client.Secrets().Delete(c.namespace, name), "secret"
+	case isIngress(resource):
+		err, resource = c.client.Ingresses().Delete(c.namespace, name), "ingress"
 	default:
 		return false, nil
 	}
@@ -116,8 +121,33 @@ func (c *cli) getWorkload(resource string) (bool, error) {
 		return true, getData(c, list[api.ConfigMap], "configmaps", func(cm api.ConfigMap) (api.ObjectMeta, int) { return cm.ObjectMeta, len(cm.Data) })
 	case isSecret(resource):
 		return true, getData(c, list[api.Secret], "secrets", func(s api.Secret) (api.ObjectMeta, int) { return s.ObjectMeta, len(s.Data) })
+	case isIngress(resource):
+		return true, c.getIngresses()
 	}
 	return false, nil
+}
+
+func (c *cli) getIngresses() error {
+	ingresses, err := list[api.Ingress](c, "ingresses")
+	if err != nil {
+		return err
+	}
+
+	w := c.newTable("NAME\tROUTES")
+	for _, ing := range ingresses {
+		var routes []string
+		for _, rule := range ing.Rules {
+			host := rule.Host
+			if host == "" {
+				host = "*"
+			}
+			for _, p := range rule.HTTP.Paths {
+				routes = append(routes, fmt.Sprintf("%s%s -> %s:%d", host, p.Path, p.Backend.Service.Name, p.Backend.Service.Port.Number))
+			}
+		}
+		c.row(w, ing.Namespace, ing.Name, strings.Join(routes, ", "))
+	}
+	return w.Flush()
 }
 
 func (c *cli) getJobs() error {

@@ -103,6 +103,11 @@ func NewHandler(st *store.Store) http.Handler {
 		typeMeta: func(c *api.ConfigMap) *api.TypeMeta { return &c.TypeMeta },
 		prepare:  prepareConfigMap,
 	})
+	serveResource(mux, st, "ingresses", "ingress", st.Ingresses, rules[api.Ingress]{
+		kind:     "Ingress",
+		typeMeta: func(i *api.Ingress) *api.TypeMeta { return &i.TypeMeta },
+		prepare:  prepareIngress,
+	})
 	serveResource(mux, st, "secrets", "secret", st.Secrets, rules[api.Secret]{
 		kind:     "Secret",
 		typeMeta: func(sec *api.Secret) *api.TypeMeta { return &sec.TypeMeta },

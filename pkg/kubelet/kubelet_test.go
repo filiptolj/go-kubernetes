@@ -36,6 +36,7 @@ type fakeRuntime struct {
 	addresses map[string]string      // address to report, by pod; "fake:<pod>" if not set
 	execCodes map[string]int         // exit code of commands run with Exec, by "pod/container"
 	execs     []string               // every command run with Exec
+	sandboxes map[string]bool        // pods with a sandbox right now
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -45,7 +46,30 @@ func newFakeRuntime() *fakeRuntime {
 		options:   make(map[string]cri.Options),
 		addresses: make(map[string]string),
 		execCodes: make(map[string]int),
+		sandboxes: make(map[string]bool),
 	}
+}
+
+// StartSandbox gives every pod the same pretend IP address.
+func (f *fakeRuntime) StartSandbox(pod api.Pod) (cri.Sandbox, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sandboxes[pod.Name] = true
+	return cri.Sandbox{IP: "10.244.128.7", HostPorts: map[int]string{}}, nil
+}
+
+func (f *fakeRuntime) StopSandbox(pod api.Pod) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.sandboxes, pod.Name)
+	return nil
+}
+
+// hasSandbox reports whether a pod's sandbox exists.
+func (f *fakeRuntime) hasSandbox(pod string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sandboxes[pod]
 }
 
 // Exec pretends to run a command: it copies stdin to out, says what it ran,
@@ -586,6 +610,23 @@ func TestDeletedPodIsStopped(t *testing.T) {
 
 	n.st.DeletePod(ns, "doomed")
 	waitFor(t, "the container to be stopped", func() bool { return !n.rt.isRunning("doomed/main") })
+	waitFor(t, "the sandbox to be removed", func() bool { return !n.rt.hasSandbox("doomed") })
+}
+
+func TestPodIPAndSandbox(t *testing.T) {
+	n := startNode(t)
+	n.run("app", never)
+	n.waitPhase("app", api.PodRunning)
+
+	if !n.rt.hasSandbox("app") {
+		t.Fatal("the pod runs without a sandbox")
+	}
+	waitFor(t, "the pod IP to be reported", func() bool { return n.pod("app").PodIP == "10.244.128.7" })
+
+	// A pod that finishes gives its sandbox back.
+	n.rt.exit("app/main", nil)
+	n.waitPhase("app", api.PodSucceeded)
+	waitFor(t, "the sandbox to be removed", func() bool { return !n.rt.hasSandbox("app") })
 }
 
 func TestSameNameNewPod(t *testing.T) {

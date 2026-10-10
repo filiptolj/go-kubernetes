@@ -29,6 +29,7 @@ type runningPod struct {
 	reason       string       // such as "CrashLoopBackOff"
 	phase        api.PodPhase // "" while running; Succeeded or Failed once finished
 	initializing bool         // its init containers haven't all finished yet
+	sandbox      *cri.Sandbox // its network, once started; nil before
 
 	// Status reports go out one at a time, so they can't arrive in the wrong
 	// order. reported is the last one sent, so unchanged ones aren't resent.
@@ -77,6 +78,17 @@ func (k *Kubelet) startPod(ctx context.Context, rp *runningPod) {
 		k.finish(rp, api.PodFailed)
 		return
 	}
+
+	sandbox, err := k.runtime.StartSandbox(pod)
+	if err != nil {
+		log.Printf("pod %s can't start: %v", api.Key(pod.Namespace, pod.Name), err)
+		k.events.Warning("Pod", pod.Namespace, pod.Name, "FailedCreatePodSandBox", "%v", err)
+		k.finish(rp, api.PodFailed)
+		return
+	}
+	k.mu.Lock()
+	rp.sandbox = &sandbox
+	k.mu.Unlock()
 
 	// No report yet: the pod stays Pending until its first container has
 	// started, and runOnce reports it Running.
@@ -213,7 +225,10 @@ func (k *Kubelet) runOnce(ctx context.Context, rp *runningPod, c api.Container, 
 	}
 	defer logs.Close()
 
-	running, err := k.runtime.Start(pod, c, cri.Options{Logs: logs, Env: setup.env, Mounts: setup.mounts})
+	k.mu.Lock()
+	sandbox := *rp.sandbox
+	k.mu.Unlock()
+	running, err := k.runtime.Start(pod, c, cri.Options{Sandbox: sandbox, Logs: logs, Env: setup.env, Mounts: setup.mounts})
 	if err != nil {
 		k.events.Warning("Pod", pod.Namespace, pod.Name, "FailedStart", "%v", err)
 		return err
@@ -374,7 +389,23 @@ func (k *Kubelet) finish(rp *runningPod, phase api.PodPhase) {
 
 	rp.cancel() // stops the readiness loop
 	k.report(rp)
+	k.removeSandbox(rp)
 	k.removeVolumes(rp.pod)
+}
+
+// removeSandbox removes a pod's sandbox, if it has one, once its containers
+// have stopped.
+func (k *Kubelet) removeSandbox(rp *runningPod) {
+	k.mu.Lock()
+	started := rp.sandbox != nil
+	k.mu.Unlock()
+	if !started {
+		return
+	}
+	err := k.runtime.StopSandbox(rp.pod)
+	if err != nil {
+		log.Printf("pod %s: %v", api.Key(rp.pod.Namespace, rp.pod.Name), err)
+	}
 }
 
 // watchReadiness checks every container's readiness, and reports the pod's
@@ -429,6 +460,9 @@ func (rp *runningPod) status() api.PodStatus {
 	}
 
 	status := api.PodStatus{Phase: api.PodRunning, Ready: true, Restarts: rp.restarts, Reason: rp.reason}
+	if rp.sandbox != nil {
+		status.PodIP = rp.sandbox.IP
+	}
 	for _, c := range rp.pod.Containers {
 		state := rp.containers[c.Name]
 		status.Ready = status.Ready && state.ready
@@ -507,5 +541,5 @@ func (k *Kubelet) openLog(pod api.Pod, c api.Container) (*os.File, error) {
 // compare a struct that holds a map with ==, so we compare field by field.
 func sameStatus(a, b api.PodStatus) bool {
 	return a.Phase == b.Phase && a.Ready == b.Ready && a.Address == b.Address &&
-		a.Restarts == b.Restarts && a.Reason == b.Reason && maps.Equal(a.HostPorts, b.HostPorts)
+		a.Restarts == b.Restarts && a.Reason == b.Reason && a.PodIP == b.PodIP && maps.Equal(a.HostPorts, b.HostPorts)
 }

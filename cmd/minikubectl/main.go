@@ -27,7 +27,7 @@ commands:
   version
 
 resources: pods, nodes, replicasets, deployments, statefulsets, daemonsets,
-jobs, cronjobs, services, configmaps, secrets, events, namespaces
+jobs, cronjobs, services, ingresses, configmaps, secrets, events, namespaces
 
 -n picks the namespace (default "default"); -A means every namespace.
 Both can go anywhere after the command.`

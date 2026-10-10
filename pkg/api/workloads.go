@@ -172,6 +172,56 @@ func (p ServicePort) Target() int {
 	return p.TargetPort
 }
 
+// Ingress routes HTTP requests to Services by host name and path, such as
+// shop.example.com/api to the Service api. The proxy serves them on its
+// ingress port.
+type Ingress struct {
+	TypeMeta
+	ObjectMeta  `json:"metadata"`
+	IngressSpec `json:"spec"`
+}
+
+// IngressSpec is an Ingress's list of rules. A request goes to the first
+// rule whose host matches, and within it to the path that is the longest
+// prefix of the request's path.
+type IngressSpec struct {
+	Rules []IngressRule `json:"rules"`
+}
+
+// IngressRule routes the requests for one host name, or for any host if
+// Host is empty.
+type IngressRule struct {
+	Host string           `json:"host,omitempty"`
+	HTTP IngressRuleValue `json:"http"`
+}
+
+// IngressRuleValue holds a rule's paths.
+type IngressRuleValue struct {
+	Paths []IngressPath `json:"paths"`
+}
+
+// IngressPath sends requests whose path starts with Path to a Service.
+// PathType is "Prefix" (the default) or "Exact".
+type IngressPath struct {
+	Path     string         `json:"path"`
+	PathType string         `json:"pathType,omitempty"`
+	Backend  IngressBackend `json:"backend"`
+}
+
+// IngressBackend names the Service, and the Service's port, to send to.
+type IngressBackend struct {
+	Service IngressServiceBackend `json:"service"`
+}
+
+type IngressServiceBackend struct {
+	Name string             `json:"name"`
+	Port ServiceBackendPort `json:"port"`
+}
+
+type ServiceBackendPort struct {
+	Number int `json:"number"`
+}
+
 // ConfigMap holds settings for pods: as environment variables, or as files
 // in a volume.
 type ConfigMap struct {

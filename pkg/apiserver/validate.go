@@ -6,6 +6,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
 	"github.com/filiptolj/go-kubernetes/pkg/cron"
@@ -282,6 +283,41 @@ func prepareService(svc *api.Service) error {
 	for _, p := range svc.Ports {
 		if p.Port < 1 || p.Port > 65535 || p.TargetPort < 0 || p.TargetPort > 65535 {
 			return errors.New("ports must be between 1 and 65535")
+		}
+	}
+	return nil
+}
+
+// prepareIngress checks an Ingress's rules, and makes "Prefix" the default
+// path type.
+func prepareIngress(ing *api.Ingress) error {
+	if len(ing.Rules) == 0 {
+		return errors.New("needs at least one rule")
+	}
+	for i := range ing.Rules {
+		rule := &ing.Rules[i]
+		if strings.ContainsAny(rule.Host, "/: ") {
+			return fmt.Errorf("host %q must be a plain host name, such as shop.example.com", rule.Host)
+		}
+		if len(rule.HTTP.Paths) == 0 {
+			return fmt.Errorf("the rule for host %q needs at least one path", rule.Host)
+		}
+		for j := range rule.HTTP.Paths {
+			p := &rule.HTTP.Paths[j]
+			if p.PathType == "" {
+				p.PathType = "Prefix"
+			}
+			b := p.Backend.Service
+			switch {
+			case !strings.HasPrefix(p.Path, "/"):
+				return fmt.Errorf("path %q must start with /", p.Path)
+			case p.PathType != "Prefix" && p.PathType != "Exact":
+				return fmt.Errorf("path %q: pathType must be Prefix or Exact, not %q", p.Path, p.PathType)
+			case b.Name == "":
+				return fmt.Errorf("path %q needs a backend service name", p.Path)
+			case b.Port.Number < 1 || b.Port.Number > 65535:
+				return fmt.Errorf("path %q: the backend service port must be between 1 and 65535", p.Path)
+			}
 		}
 	}
 	return nil

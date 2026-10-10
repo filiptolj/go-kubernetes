@@ -4,12 +4,13 @@ A small Kubernetes, written from scratch in Go.
 
 It has the same moving parts as the real thing: an API server backed by etcd,
 a scheduler, controllers, a kubelet on every node that runs real Docker
-containers, and a proxy that makes Services reachable. Pods, Deployments with
+containers, a pod network with cluster DNS, and a proxy that makes Services
+reachable from pods and from your machine. Pods, Deployments with
 zero-downtime rolling updates, StatefulSets, DaemonSets, Jobs, CronJobs,
 Services, ConfigMaps, Secrets, volumes, probes, resource limits, namespaces,
 events and a `kubectl`-style CLI all work, and objects are written in the same
-YAML as for Kubernetes. Apart from the etcd client and a YAML reader, it uses
-only Go's standard library.
+YAML as for Kubernetes. Apart from the etcd client, a YAML reader and a DNS
+message parser, it uses only Go's standard library.
 
 It was built as a learning project: to understand how Kubernetes works by
 building it, and to learn Go along the way. It is not meant for production.
@@ -48,7 +49,10 @@ Events:
 - **Jobs** that run pods until enough succeed, and **CronJobs** that create Jobs on a schedule
 - **ConfigMaps** and **Secrets**, given to containers as environment variables or files
 - **Volumes**: `emptyDir` shared by a pod's containers, `hostPath`, and ConfigMaps and Secrets as files
-- **Services** that give a group of pods one address, with load balancing across the ready ones
+- **A pod network**: every pod gets its own IP address, shared by its containers, which also share `localhost`
+- **Cluster DNS**: pods reach Services by name, such as `http://web:8081` or `web.default.svc.cluster.local`
+- **Services** that give a group of pods one address, with load balancing across the ready ones, reachable from pods and from your machine
+- **Ingress**: HTTP requests routed to Services by host name and path
 - **Self-healing**: a node that stops sending heartbeats is marked NotReady and its pods are replaced elsewhere
 - **Namespaces**, so the same names can be used by different teams or apps
 - **Events** that record what happened to each object, shown by `minikubectl describe`
@@ -63,7 +67,7 @@ Events:
 
 - **Linux**, or Windows with **WSL 2**. The kubelet uses Linux process groups.
 - **Go 1.26** or newer. With Go 1.21 or newer installed, Go downloads 1.26 by itself the first time you build.
-- **Docker**, to run pods as containers. Without it, use `-runtime process` (see below).
+- **Docker**, to run pods as containers. Without it, use `-runtime process` (see below). The first start downloads two small images, `registry.k8s.io/pause` and `busybox`.
 - **etcd**, only if you want to store the cluster in etcd instead of a file.
 
 ## Quick start
@@ -77,7 +81,8 @@ go build -o bin/ ./cmd/...
 ```
 
 `minik8s` starts the whole cluster in one terminal: the API server, the
-controller manager, the scheduler, the proxy and two nodes. Their logs are
+controller manager, the scheduler, the proxy, two nodes, and the cluster
+proxy, a container on the pod network that serves DNS and Services to pods. Their logs are
 shown together, each line marked with the component it came from. Press
 Ctrl+C to stop everything; the nodes remove their containers on the way out.
 
@@ -93,6 +98,18 @@ In a second terminal:
 ./bin/minikubectl get pods -w                             # watch them start (Ctrl+C to stop watching)
 
 curl http://localhost:8081                                # "Welcome to nginx!", from one of the pods
+```
+
+From inside the cluster, pods reach the Service by name, and an Ingress
+routes requests by host name:
+
+```bash
+./bin/minikubectl apply -f examples/toolbox.yaml          # a pod with wget and nslookup
+./bin/minikubectl exec toolbox -- wget -qO- http://web:8081
+./bin/minikubectl get pods                                # each pod has its own IP
+
+./bin/minikubectl apply -f examples/ingress.yaml          # shop.local -> the web Service
+curl -H "Host: shop.local" http://localhost:8090/
 ```
 
 Try a rolling update: change `nginx:1.27` to `nginx:1.28` in
@@ -117,6 +134,8 @@ with `get`, `describe` and `logs`:
 | `web-rs.yaml`, `flaky-rs.yaml` | ReplicaSets, one of them crashing every 10 seconds |
 | `oom.yaml` | a pod that uses more memory than its limit, and is `OOMKilled` |
 | `init-and-exec.yaml` | an init container writes a web page before nginx starts; the readiness probe runs a command |
+| `ingress.yaml` | routes `shop.local` on the ingress port to the `web` Service |
+| `toolbox.yaml` | a busybox pod for looking around the pod network with `exec` |
 
 `minikubectl apply -f examples/` applies the whole folder; applying it again
 updates what can be updated and leaves the rest as it is.
@@ -130,7 +149,8 @@ updates what can be updated and leaves the rest as it is.
 | `-etcd` | | store the cluster in etcd at this address, such as `localhost:2379` |
 | `-data` | `data/apiserver.json` | file to store the cluster in when not using etcd; `""` keeps it in memory only |
 | `-port` | `8080` | the API server's port |
-| `-kubelet-port` | `10250` | the first node's port for serving logs; the next nodes use the ports after it |
+| `-kubelet-port` | `10250` | the first node's port for serving logs and exec; the next nodes use the ports after it |
+| `-ingress-port` | `8090` | where Ingresses are served on `127.0.0.1`; `0` for nowhere |
 
 ### Using etcd
 
@@ -230,6 +250,7 @@ spec:
 | `Service` | `v1` | `spec`: `selector`, `ports` (`port`, and `targetPort`, which defaults to `port`) |
 | `ConfigMap` | `v1` | `data` (keys and values) |
 | `Secret` | `v1` | `data` (values in base64) or `stringData` (plain values) |
+| `Ingress` | `networking.k8s.io/v1` | `spec.rules`: a `host` (or none, for any host) and `http.paths`, each a `path`, a `pathType` (`Prefix`, the default, or `Exact`) and a `backend.service` `name` and `port.number` |
 | `Namespace`, `Node` | `v1` | `metadata.name` |
 
 Every object has a `metadata.name`, and may have `labels`. Objects other
@@ -318,6 +339,37 @@ When the template changes, the Deployment controller creates a second
 ReplicaSet and moves pods over one at a time: it adds a new pod, waits until
 it is ready, then removes an old one.
 
+### Networking
+
+With the Docker runtime, every pod gets a **sandbox**: a tiny "pause"
+container on a Docker network called `minik8s` (`10.244.0.0/16`). The pod's
+containers join its network, so they share its IP address and can reach
+each other on `localhost`, as in Kubernetes. The sandbox also publishes
+every container port on `127.0.0.1`, which is how your machine reaches pods.
+
+Inside the network, at the fixed address `10.244.0.2`, runs the **cluster
+proxy**: the `proxy` program again, in a container. It is the cluster's DNS
+server: `<service>.<namespace>.svc.cluster.local` resolves to its own
+address, and other names go on to Docker's DNS. Pods' DNS settings search
+their own namespace, so `web` alone works too. It also listens on every
+Service's port and forwards connections to the Service's ready pods, by
+their pod IPs.
+
+The proxy on your machine does the same for `127.0.0.1:<service port>`, and
+serves **Ingresses** on the ingress port: each request goes to the Service
+of the rule whose host matches, and whose path is the longest prefix of the
+request's path.
+
+```
+ your machine                         minik8s network (10.244.0.0/16)
+ ────────────                         ───────────────────────────────
+ curl localhost:8081 ─▶ proxy ─┐      ┌─ pod web-a (10.244.128.1) ◀─┐
+ curl -H Host:shop.local       ├────▶ ├─ pod web-b (10.244.128.2) ◀─┤
+      localhost:8090 ─▶ ingress┘      │                             │
+                                      └─ pod toolbox ─▶ web:8081 ─▶ cluster proxy
+                                         (DNS: web → 10.244.0.2)     (10.244.0.2)
+```
+
 ### Components
 
 | Program | Package | Role |
@@ -326,7 +378,7 @@ it is ready, then removes an old one.
 | `controller-manager` | [`pkg/controller`](pkg/controller), [`pkg/cron`](pkg/cron) | the node, ReplicaSet, Deployment, StatefulSet, DaemonSet, Job and CronJob controllers |
 | `scheduler` | [`pkg/scheduler`](pkg/scheduler) | assigns pods to nodes |
 | `kubelet` | [`pkg/kubelet`](pkg/kubelet), [`pkg/cri`](pkg/cri) | runs pods on one node: restarts containers, runs probes, sets up volumes and environment, serves logs and exec |
-| `proxy` | [`pkg/proxy`](pkg/proxy) | forwards connections on Service ports to ready pods |
+| `proxy` | [`pkg/proxy`](pkg/proxy) | forwards connections on Service ports to ready pods and serves Ingresses; inside the pod network, also the cluster DNS |
 | `minikubectl` | [`pkg/client`](pkg/client) | the command-line tool |
 | `minik8s` | | starts all of the above in one terminal |
 
@@ -346,7 +398,7 @@ pkg/
   scheduler/   scheduling strategies
   kubelet/     running pods on a node
   cri/         running containers: Docker or plain processes
-  proxy/       forwarding Service traffic
+  proxy/       forwarding Service traffic, Ingress and cluster DNS
 examples/   object files to apply
 learn/      small programs written while learning goroutines, channels and os/exec
 ```
@@ -373,7 +425,9 @@ The overall design follows Kubernetes, but many things are simplified:
 - Objects have Kubernetes' shape but fewer fields, and unknown fields are ignored rather than refused.
 - There is one API server. Watches and conflict checks happen in its memory, so several API servers can't share one etcd.
 - There is no authentication or authorization: anyone who can reach the API server can change anything.
-- Pod networking is the host's: each container's port is published on a free port of the machine, and Service ports are shared by all namespaces.
+- Services have no cluster IP of their own: every Service name resolves to the cluster proxy's one address, so two Services can't use the same port, even in different namespaces.
+- Pods run by the process runtime have no pod network: they use the machine's, so they get no IP and no cluster DNS.
+- The cluster DNS only answers for Services (A records), not for pods, and only over UDP.
 - `minikubectl logs`, `exec` and `port-forward` talk to the kubelet, or the pod's published port, directly instead of going through the API server; `exec` has no terminal (`-t`).
 - A watch only sends changes from the moment it starts; there is no resuming from a `resourceVersion`.
 - Events are kept in memory only and are lost when the API server restarts.
@@ -381,7 +435,8 @@ The overall design follows Kubernetes, but many things are simplified:
 - Secrets are stored as plain text, not encrypted.
 - Volumes need the Docker runtime, and only `emptyDir`, `hostPath`, ConfigMaps and Secrets exist: there are no persistent volumes, so a StatefulSet's pods don't keep their data when they move.
 - Resource limits need the Docker runtime; the process runtime ignores them.
-- No Ingress, network policies or autoscaling.
+- Ingress is HTTP only (no TLS), and has no ingress classes or default backend.
+- No network policies or autoscaling.
 
 ## License
 

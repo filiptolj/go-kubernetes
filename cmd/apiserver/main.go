@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 
@@ -22,8 +23,23 @@ func main() {
 	}
 	defer st.Close()
 
-	log.Printf("mini-apiserver listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, apiserver.NewHandler(st)))
+	// An IPv4 address, such as 0.0.0.0:8080, gets an IPv4-only socket. With
+	// plain "tcp", Go would make 0.0.0.0 mean every IPv4 and IPv6 address,
+	// and on WSL, connections from Docker containers only arrive at IPv4
+	// sockets.
+	network := "tcp"
+	if host, _, err := net.SplitHostPort(*addr); err == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+			network = "tcp4"
+		}
+	}
+	l, err := net.Listen(network, *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("mini-apiserver listening on %s", l.Addr())
+	log.Fatal(http.Serve(l, apiserver.NewHandler(st)))
 }
 
 // openStore picks where the cluster state is kept: etcd if endpoints are

@@ -1,5 +1,7 @@
 // Command minik8s starts a whole cluster with one command: the API server,
 // the controller manager, the scheduler, the proxy and a kubelet per node.
+// With the Docker runtime, it also starts the cluster's DNS and Service
+// proxy inside the cluster network, as a container.
 // Each runs as its own process, like in real Kubernetes; minik8s starts them
 // in the right order, prints their logs with the component's name in front,
 // and stops them all on Ctrl+C.
@@ -27,6 +29,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/filiptolj/go-kubernetes/pkg/cri"
 )
 
 func main() {
@@ -37,6 +41,7 @@ func main() {
 	dataFile := flag.String("data", "data/apiserver.json", "file the API server saves the cluster in (empty: memory only)")
 	etcd := flag.String("etcd", "", "save the cluster in etcd at this address, such as localhost:2379, instead of a file")
 	binDir := flag.String("bin", "", "folder with the component programs (default: the folder minik8s is in)")
+	ingressPort := flag.Int("ingress-port", 8090, "port on 127.0.0.1 where Ingresses are served (0: none)")
 	flag.Parse()
 
 	dir, err := findBinaries(*binDir)
@@ -47,7 +52,10 @@ func main() {
 	server := fmt.Sprintf("http://localhost:%d", *port)
 
 	// The API server goes first: everything else talks to it.
-	apiserver := component{name: "apiserver", args: []string{"-addr", fmt.Sprintf(":%d", *port), "-data", *dataFile}}
+	// 0.0.0.0, not just ":port": the cluster proxy's container reaches the API
+	// server through Docker's host.docker.internal, and on WSL that only
+	// arrives at IPv4 listeners. ":port" would listen on IPv6 ([::]) too.
+	apiserver := component{name: "apiserver", args: []string{"-addr", fmt.Sprintf("0.0.0.0:%d", *port), "-data", *dataFile}}
 	if *etcd != "" {
 		apiserver.args = append(apiserver.args, "-etcd", *etcd)
 	}
@@ -56,6 +64,16 @@ func main() {
 		{name: "controller-manager", args: []string{"-server", server}},
 		{name: "scheduler", args: []string{"-server", server}},
 		{name: "proxy", args: []string{"-server", server}},
+	}
+	if *ingressPort != 0 {
+		others[2].args = append(others[2].args, "-ingress-addr", fmt.Sprintf("127.0.0.1:%d", *ingressPort))
+	}
+	if *runtime == "docker" {
+		err := cri.EnsureNetwork()
+		if err != nil {
+			log.Fatal(err)
+		}
+		others = append(others, clusterProxy(dir, *port))
 	}
 	for i := range *nodes {
 		node := fmt.Sprintf("node-%d", i+1)
@@ -88,6 +106,11 @@ func findBinaries(dir string) (string, error) {
 		}
 		dir = filepath.Dir(self)
 	}
+	// Docker needs a full path to mount the proxy program.
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
 
 	for _, name := range []string{"apiserver", "controller-manager", "scheduler", "proxy", "kubelet"} {
 		_, err := os.Stat(filepath.Join(dir, name))
@@ -98,11 +121,38 @@ func findBinaries(dir string) (string, error) {
 	return dir, nil
 }
 
+// clusterProxyName is the Docker name of the cluster-proxy container.
+const clusterProxyName = "minik8s-cluster-proxy"
+
+// clusterProxy is the proxy program again, run in a container on the
+// cluster network at a fixed address: there it serves the cluster's DNS
+// and forwards Service ports to pod IPs, so pods can reach Services by
+// name. Its image only needs to provide the C library the program uses; the
+// program itself comes from this machine. It reaches the API server on this
+// machine through host.docker.internal.
+func clusterProxy(dir string, apiPort int) component {
+	exec.Command("docker", "rm", "-f", clusterProxyName).Run() // a leftover from a crash
+	return component{
+		program: "docker",
+		label:   "cluster-proxy",
+		args: []string{"run", "--rm", "--name", clusterProxyName,
+			"--label", "minik8s=true",
+			"--network", cri.NetworkName, "--ip", cri.ClusterProxyIP,
+			"--add-host", "host.docker.internal:host-gateway",
+			"-v", filepath.Join(dir, "proxy") + ":/proxy:ro",
+			"busybox:1.36-glibc", "/proxy",
+			"-server", fmt.Sprintf("http://host.docker.internal:%d", apiPort),
+			"-bind", "0.0.0.0", "-pod-ips",
+			"-dns", ":53", "-dns-service-ip", cri.ClusterProxyIP, "-domain", cri.ClusterDomain},
+	}
+}
+
 // component is one program of the cluster.
 type component struct {
-	name  string   // the program's file name, such as "kubelet"
-	label string   // what to print in front of its log lines; name if empty
-	args  []string // its command-line flags
+	name    string   // the program's file name, such as "kubelet"
+	program string   // a program to run instead, found on the PATH, such as "docker"
+	label   string   // what to print in front of its log lines; name if empty
+	args    []string // its command-line flags
 }
 
 // process is a running component.
@@ -170,7 +220,11 @@ func (c *cluster) start(comp component, exited chan<- *process) (*process, error
 		label = comp.name
 	}
 
-	cmd := exec.Command(filepath.Join(c.dir, comp.name), comp.args...)
+	path := filepath.Join(c.dir, comp.name)
+	if comp.program != "" {
+		path = comp.program
+	}
+	cmd := exec.Command(path, comp.args...)
 
 	// The component's output, both normal and error, goes through a pipe:
 	// everything it writes comes out of the other end, line by line, and is
@@ -225,6 +279,8 @@ func (c *cluster) stopAll() {
 	for i := len(running) - 1; i >= 0; i-- {
 		stop(running[i])
 	}
+	// In case the cluster proxy's container outlived its `docker run`.
+	exec.Command("docker", "rm", "-f", clusterProxyName).Run()
 }
 
 // stop asks a process to stop, the way Ctrl+C would, and waits for it. If it

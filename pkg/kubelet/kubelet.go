@@ -303,6 +303,7 @@ func (k *Kubelet) stopPod(pod api.Pod) bool {
 		}
 	}
 	rp.wg.Wait() // until every container loop has finished
+	k.removeSandbox(rp)
 	k.removeVolumes(rp.pod)
 
 	k.mu.Lock()

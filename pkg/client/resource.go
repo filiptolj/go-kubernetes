@@ -44,6 +44,11 @@ func (c *Client) Secrets() *Resource[api.Secret] {
 	return &Resource[api.Secret]{c, "secrets", "secret"}
 }
 
+// Ingresses returns a client for Ingresses.
+func (c *Client) Ingresses() *Resource[api.Ingress] {
+	return &Resource[api.Ingress]{c, "ingresses", "ingress"}
+}
+
 // List fetches the objects in a namespace, or in all namespaces if
 // namespace is "".
 func (r *Resource[T]) List(namespace string) ([]T, error) {

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os/exec"
 	"syscall"
 
@@ -17,6 +16,13 @@ import (
 
 // Runtime starts and stops containers.
 type Runtime interface {
+	// StartSandbox prepares what a pod's containers share, before any of
+	// them start: its network, with its IP address and published ports.
+	StartSandbox(pod api.Pod) (Sandbox, error)
+
+	// StopSandbox removes a pod's sandbox, once its containers are gone.
+	StopSandbox(pod api.Pod) error
+
 	// Start starts one container of a pod and returns at once.
 	Start(pod api.Pod, c api.Container, opts Options) (Running, error)
 
@@ -36,9 +42,10 @@ type Runtime interface {
 // Options are what a container starts with, besides its image and command.
 // The kubelet works them out from the pod.
 type Options struct {
-	Logs   io.Writer // where the container's output goes
-	Env    []string  // environment variables, as "NAME=value"
-	Mounts []Mount   // folders of this machine to show inside the container
+	Sandbox Sandbox   // the pod's sandbox, from StartSandbox
+	Logs    io.Writer // where the container's output goes
+	Env     []string  // environment variables, as "NAME=value"
+	Mounts  []Mount   // folders of this machine to show inside the container
 }
 
 // Mount puts a folder of this machine at a path inside a container.
@@ -46,6 +53,17 @@ type Mount struct {
 	HostPath      string
 	ContainerPath string
 	ReadOnly      bool
+}
+
+// Sandbox is what a pod's containers share: their network.
+type Sandbox struct {
+	// IP is the pod's address on the cluster network, or "" if the
+	// runtime doesn't give pods one.
+	IP string
+
+	// HostPorts says where each port of the pod's containers can be
+	// reached from this machine, as host:port, by container port.
+	HostPorts map[int]string
 }
 
 // Running is a container that Start started.
@@ -100,19 +118,6 @@ func runExec(cmd *exec.Cmd, stdin io.Reader, out io.Writer) (int, error) {
 		return -1, err
 	}
 	return 0, nil
-}
-
-// freePort asks the operating system for a TCP port that nobody is using.
-func freePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-
-	// Addr returns the general net.Addr interface. For a TCP listener the
-	// value inside is a *net.TCPAddr, which has the Port field we need.
-	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 // start runs cmd in the background and returns a channel that receives the

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
 	"syscall"
 
@@ -22,6 +23,23 @@ type ProcessRuntime struct {
 // NewProcessRuntime returns a ProcessRuntime, ready to use.
 func NewProcessRuntime() *ProcessRuntime {
 	return &ProcessRuntime{procs: make(map[string]*exec.Cmd)}
+}
+
+// StartSandbox gives the pod nothing to share: plain processes use this
+// machine's network, so each container port is reachable at itself.
+func (pr *ProcessRuntime) StartSandbox(pod api.Pod) (Sandbox, error) {
+	sb := Sandbox{HostPorts: make(map[int]string)}
+	for _, c := range slices.Concat(pod.InitContainers, pod.Containers) {
+		for _, p := range c.Ports {
+			sb.HostPorts[p.ContainerPort] = fmt.Sprintf("127.0.0.1:%d", p.ContainerPort)
+		}
+	}
+	return sb, nil
+}
+
+// StopSandbox does nothing: there is no sandbox to remove.
+func (pr *ProcessRuntime) StopSandbox(pod api.Pod) error {
+	return nil
 }
 
 // Start runs the container's command as a process. A process shares this

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,9 +25,20 @@ type Proxy struct {
 	Every    time.Duration // how often to look again even if nothing changed
 	BindAddr string        // where to listen, such as "127.0.0.1"
 
-	// Where to read Services and pods. If nil, the proxy asks the API server.
-	Services *client.Informer[api.Service]
-	Pods     *client.Informer[api.Pod]
+	// IngressAddr is where to serve Ingresses, such as "127.0.0.1:8090";
+	// "" for nowhere.
+	IngressAddr string
+
+	// PodIPs makes the proxy send connections to the pods' own addresses on
+	// the cluster network, instead of to where their ports are published
+	// on this machine. The proxy that runs inside the cluster network uses it.
+	PodIPs bool
+
+	// Where to read Services, pods and Ingresses. If nil, the proxy asks
+	// the API server.
+	Services  *client.Informer[api.Service]
+	Pods      *client.Informer[api.Pod]
+	Ingresses *client.Informer[api.Ingress]
 
 	mu       sync.Mutex
 	services map[string]*service // by "namespace/name:port"
@@ -50,6 +62,9 @@ type endpoint struct {
 // Run keeps the proxy in sync with the Services and pods, whenever they
 // change, until ctx is cancelled. Then it stops listening.
 func (p *Proxy) Run(ctx context.Context) {
+	if p.IngressAddr != "" {
+		go p.serveIngress(ctx, p.IngressAddr)
+	}
 	client.RunOnChange(ctx, "proxy", p.Every, p.sync, p.Services, p.Pods)
 	p.closeAll()
 }
@@ -103,7 +118,7 @@ func (p *Proxy) sync() {
 			}
 			s.svc, s.port = svc, port
 
-			endpoints := endpointsFor(svc, port, pods)
+			endpoints := endpointsFor(svc, port, pods, p.PodIPs)
 			if !slices.Equal(endpoints, s.endpoints) {
 				log.Printf("service %s: %d pods to forward to", key, len(endpoints))
 				s.endpoints = endpoints
@@ -122,14 +137,21 @@ func (p *Proxy) sync() {
 
 // endpointsFor returns where to send connections to one port of a Service:
 // the target port of every ready pod it selects, in its own namespace, with
-// matching labels.
-func endpointsFor(svc api.Service, port api.ServicePort, pods []api.Pod) []endpoint {
+// matching labels. With podIPs, that is the pod's IP and the target port;
+// otherwise, where the target port is published on this machine.
+func endpointsFor(svc api.Service, port api.ServicePort, pods []api.Pod, podIPs bool) []endpoint {
 	var endpoints []endpoint
 	for _, pod := range pods {
 		if pod.Namespace != svc.Namespace || pod.Phase != api.PodRunning || !pod.Ready || !pod.Labels.Matches(svc.Selector) {
 			continue
 		}
 		address := pod.HostPorts[port.Target()]
+		if podIPs {
+			address = ""
+			if pod.PodIP != "" {
+				address = net.JoinHostPort(pod.PodIP, strconv.Itoa(port.Target()))
+			}
+		}
 		if address != "" {
 			endpoints = append(endpoints, endpoint{Pod: pod.Name, Address: address})
 		}

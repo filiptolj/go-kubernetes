@@ -43,6 +43,7 @@ type Store struct {
 	StatefulSets *Resource[api.StatefulSet]
 	ConfigMaps   *Resource[api.ConfigMap]
 	Secrets      *Resource[api.Secret]
+	Ingresses    *Resource[api.Ingress]
 	resources    []resource
 
 	events      []api.Event
@@ -78,6 +79,7 @@ func New() *Store {
 	s.StatefulSets = newResource[api.StatefulSet](s, "statefulSets", "statefulset")
 	s.ConfigMaps = newResource[api.ConfigMap](s, "configMaps", "configmap")
 	s.Secrets = newResource[api.Secret](s, "secrets", "secret")
+	s.Ingresses = newResource[api.Ingress](s, "ingresses", "ingress")
 	return s
 }
 
@@ -225,6 +227,9 @@ func (s *Store) SetPodStatus(namespace, name string, status api.PodStatus) (api.
 	}
 	if status.HostPorts != nil {
 		pod.HostPorts = status.HostPorts
+	}
+	if status.PodIP != "" {
+		pod.PodIP = status.PodIP
 	}
 	pod.ResourceVersion = s.nextVersion()
 

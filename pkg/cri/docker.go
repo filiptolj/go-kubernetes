@@ -2,11 +2,15 @@ package cri
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
@@ -28,10 +32,97 @@ func containerName(pod api.Pod, c api.Container) string {
 	return "minik8s-" + pod.Namespace + "-" + pod.Name + "-" + c.Name
 }
 
-// Start runs `docker run` for the container. The docker process keeps running
-// as long as the container does, and exits with the container's exit code.
-// Each of the container's ports is published on a free port of this machine,
-// and its resource limits become Docker's limits.
+// pauseImage is the image of a pod's sandbox container. Its program does
+// nothing but wait: the container is only there to hold the pod's network.
+const pauseImage = "registry.k8s.io/pause:3.10"
+
+// sandboxName is the Docker name of a pod's sandbox container. Container
+// names can't contain dots, so it can't clash with a container of the pod.
+func sandboxName(pod api.Pod) string {
+	return "minik8s-" + pod.Namespace + "-" + pod.Name + ".sandbox"
+}
+
+// StartSandbox starts the pod's sandbox: a pause container on the cluster
+// network, as in Kubernetes. The pod's containers join its network, so they
+// share its IP address and can reach each other on localhost. Every port of
+// every container is published on 127.0.0.1, so this machine can reach the
+// pod too. Its DNS settings send cluster names to the cluster DNS server,
+// and the containers that join it get the same.
+func (dr DockerRuntime) StartSandbox(pod api.Pod) (Sandbox, error) {
+	err := EnsureNetwork()
+	if err != nil {
+		return Sandbox{}, err
+	}
+
+	name := sandboxName(pod)
+	exec.Command("docker", "rm", "-f", name).Run() // a leftover from a crashed kubelet
+
+	args := []string{"run", "-d", "--name", name,
+		"--label", "minik8s.node=" + dr.Node,
+		"--label", "minik8s.namespace=" + pod.Namespace,
+		"--label", "minik8s.pod=" + pod.Name,
+		"--hostname", pod.Name,
+		"--network", NetworkName,
+		"--dns", ClusterProxyIP,
+		"--dns-search", pod.Namespace + ".svc." + ClusterDomain,
+		"--dns-search", "svc." + ClusterDomain,
+		"--dns-search", ClusterDomain,
+		// Names with fewer than 5 dots, like "web", try the search
+		// domains first, as in Kubernetes.
+		"--dns-option", "ndots:5"}
+	for _, c := range slices.Concat(pod.InitContainers, pod.Containers) {
+		for _, p := range c.Ports {
+			// No host port given: Docker picks a free one.
+			args = append(args, "-p", fmt.Sprintf("127.0.0.1::%d", p.ContainerPort))
+		}
+	}
+	args = append(args, pauseImage)
+
+	out, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		return Sandbox{}, fmt.Errorf("start the pod's sandbox: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return inspectSandbox(name)
+}
+
+// inspectSandbox asks Docker for a sandbox's IP address and published ports.
+func inspectSandbox(name string) (Sandbox, error) {
+	out, err := exec.Command("docker", "inspect", "--format", "{{json .NetworkSettings}}", name).Output()
+	if err != nil {
+		return Sandbox{}, fmt.Errorf("inspect the pod's sandbox: %w", err)
+	}
+	var settings struct {
+		Networks map[string]struct{ IPAddress string }
+		Ports    map[string][]struct{ HostIP, HostPort string }
+	}
+	err = json.Unmarshal(out, &settings)
+	if err != nil {
+		return Sandbox{}, fmt.Errorf("inspect the pod's sandbox: %w", err)
+	}
+
+	sb := Sandbox{IP: settings.Networks[NetworkName].IPAddress, HostPorts: make(map[int]string)}
+	for spec, bindings := range settings.Ports { // spec is like "80/tcp"
+		port, err := strconv.Atoi(strings.TrimSuffix(spec, "/tcp"))
+		if err != nil || len(bindings) == 0 {
+			continue
+		}
+		sb.HostPorts[port] = net.JoinHostPort(bindings[0].HostIP, bindings[0].HostPort)
+	}
+	return sb, nil
+}
+
+// StopSandbox removes the pod's sandbox container.
+func (dr DockerRuntime) StopSandbox(pod api.Pod) error {
+	out, err := exec.Command("docker", "rm", "-f", sandboxName(pod)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("remove the pod's sandbox: %v: %s", err, out)
+	}
+	return nil
+}
+
+// Start runs `docker run` for the container, inside the pod's sandbox. The
+// docker process keeps running as long as the container does, and exits
+// with the container's exit code. Its resource limits become Docker's limits.
 //
 // Environment variables are passed in a file only the current user can read,
 // not on the command line, where anyone on the machine could see them with
@@ -54,15 +145,12 @@ func (dr DockerRuntime) Start(pod api.Pod, c api.Container, opts Options) (Runni
 		"--label", "minik8s.namespace=" + pod.Namespace,
 		"--label", "minik8s.pod=" + pod.Name}
 
+	// Join the sandbox's network: same IP, same localhost, and its ports
+	// already published.
+	args = append(args, "--network", "container:"+sandboxName(pod))
 	hostPorts := make(map[int]string)
 	for _, p := range c.Ports {
-		hostPort, err := freePort()
-		if err != nil {
-			return Running{}, fmt.Errorf("container %q: find a free port: %w", c.Name, err)
-		}
-		// Connections to 127.0.0.1:hostPort on this machine reach the port inside the container.
-		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d", hostPort, p.ContainerPort))
-		hostPorts[p.ContainerPort] = fmt.Sprintf("127.0.0.1:%d", hostPort)
+		hostPorts[p.ContainerPort] = opts.Sandbox.HostPorts[p.ContainerPort]
 	}
 	address := hostPorts[c.Port()]
 

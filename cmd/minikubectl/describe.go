@@ -50,6 +50,7 @@ func (c *cli) describePod(name string) error {
 	field("Ready", yesNo(pod.Ready))
 	field("Restarts", fmt.Sprint(pod.Restarts))
 	field("Restart", string(pod.RestartPolicy))
+	field("IP", orNone(pod.PodIP))
 	field("Address", orNone(pod.Address))
 	field("Started", formatTime(pod.StartedAt))
 	field("Finished", formatTime(pod.FinishedAt))
@@ -260,6 +261,7 @@ func (c *cli) describeService(name string) error {
 	field("Name", svc.Name)
 	field("Namespace", svc.Namespace)
 	field("Ports", servicePorts(svc))
+	field("DNS name", svc.Name+"."+svc.Namespace+".svc.cluster.local (from pods)")
 	field("Selector", formatLabels(svc.Selector))
 
 	fmt.Println("Endpoints:")
