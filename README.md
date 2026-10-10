@@ -6,9 +6,10 @@ It has the same moving parts as the real thing: an API server backed by etcd,
 a scheduler, controllers, a kubelet on every node that runs real Docker
 containers, and a proxy that makes Services reachable. Pods, Deployments with
 zero-downtime rolling updates, StatefulSets, DaemonSets, Jobs, CronJobs,
-Services, ConfigMaps, Secrets, volumes, probes, namespaces, events and a
-`kubectl`-style CLI all work. Apart from the etcd client, it uses only Go's
-standard library.
+Services, ConfigMaps, Secrets, volumes, probes, resource limits, namespaces,
+events and a `kubectl`-style CLI all work, and objects are written in the same
+YAML as for Kubernetes. Apart from the etcd client and a YAML reader, it uses
+only Go's standard library.
 
 It was built as a learning project: to understand how Kubernetes works by
 building it, and to learn Go along the way. It is not meant for production.
@@ -34,9 +35,12 @@ Events:
 
 ## Features
 
+- **Kubernetes-style objects**: `apiVersion`, `kind`, `metadata`, `spec` and `status`, written in YAML, served under the same URLs (`/api/v1`, `/apis/apps/v1`, ...)
 - **Pods** that run as real Docker containers, or as plain processes
+- **Init containers** that run one after the other, to completion, before the pod's other containers start
 - **Restart policies**: crashed containers are restarted in place, waiting longer each time (`CrashLoopBackOff`)
-- **Liveness and readiness probes**, by HTTP request or by checking the port
+- **Liveness and readiness probes**, by HTTP request, by running a command in the container, or by checking the port
+- **Resource requests and limits**: the scheduler only puts a pod where its CPU and memory requests fit, and Docker enforces the limits; a container that uses too much memory is `OOMKilled`
 - **Scheduling** of pods onto nodes, with a choice of strategies (least loaded, round robin)
 - **ReplicaSets** and **Deployments**, with rolling updates that keep the app available the whole time
 - **StatefulSets**: numbered pods (`db-0`, `db-1`, ...) created in order, each once the one before is ready
@@ -48,7 +52,10 @@ Events:
 - **Self-healing**: a node that stops sending heartbeats is marked NotReady and its pods are replaced elsewhere
 - **Namespaces**, so the same names can be used by different teams or apps
 - **Events** that record what happened to each object, shown by `minikubectl describe`
-- **Logs** of any container, also followed live with `-f`
+- **Logs** of any container, also followed live with `-f`; **exec** to run a command inside one; **port-forward** to reach a pod's port
+- **Label selectors** (`-l app=web`, `env in (prod,dev)`) and full objects as YAML or JSON (`-o yaml`)
+- **Watches** of every kind, and **informers**: the controllers, scheduler and proxy keep a local copy of what they need, kept current by a watch, and react to changes at once
+- **Optimistic concurrency**: every object has a `resourceVersion`, and an update made from an outdated copy is refused instead of losing someone else's change
 - **Storage** in etcd, or in a JSON file; every component reconnects if the API server restarts
 - **Tests** with the race detector, including a fake container runtime and an in-memory API server
 
@@ -108,6 +115,11 @@ with `get`, `describe` and `logs`:
 | `liveness.yaml` | nginx with a liveness probe on a page that doesn't exist: watch it get restarted |
 | `crash.yaml`, `hello.yaml` | pods with `restartPolicy: Never`, which fail or finish once |
 | `web-rs.yaml`, `flaky-rs.yaml` | ReplicaSets, one of them crashing every 10 seconds |
+| `oom.yaml` | a pod that uses more memory than its limit, and is `OOMKilled` |
+| `init-and-exec.yaml` | an init container writes a web page before nginx starts; the readiness probe runs a command |
+
+`minikubectl apply -f examples/` applies the whole folder; applying it again
+updates what can be updated and leaves the rest as it is.
 
 `minik8s` takes a few options:
 
@@ -147,11 +159,13 @@ $ docker exec minik8s-etcd etcdctl get --prefix /minik8s/ --keys-only
 
 | Command | What it does |
 |---|---|
-| `get <resource>` | list objects; `get pods -w` keeps watching for changes |
+| `get <resource> [name]` | list objects; `-l app=web` picks them by label, `-o yaml`, `-o json` or `-o name` prints them in full, and `get pods -w` keeps watching for changes |
 | `describe <resource> <name>` | details and recent events |
-| `apply -f <file.yaml>` | create the object in a file; applying it again updates it |
+| `apply -f <file or folder>` | create the objects in YAML (or JSON) files, several per file separated by `---`; applying again updates them |
 | `delete <resource> <name>` | delete an object; a namespace is deleted with everything in it |
 | `logs <pod> [-c container] [-f]` | a container's output; `-f` follows it |
+| `exec <pod> [-c container] [-i] -- <command>` | run a command in a container; `-i` passes your input to it, and `minikubectl` exits with the command's exit code |
+| `port-forward <pod> [local:]<port>` | reach a pod's port at `localhost:local`, until Ctrl+C |
 | `scale replicaset\|deployment\|statefulset <name> <n>` | change the number of replicas |
 | `create namespace <name>` | create a namespace |
 
@@ -168,46 +182,60 @@ Short names work too: `po`, `no`, `rs`, `deploy`, `sts`, `ds`, `cj`, `svc`,
 
 ## Writing objects
 
-Objects are JSON files with a `kind`. These are in [`examples/`](examples):
+Objects are written as in Kubernetes. These are in [`examples/`](examples):
 
-```json
-{
-  "kind": "Deployment",
-  "name": "web",
-  "replicas": 3,
-  "template": {
-    "labels": { "app": "web" },
-    "containers": [
-      { "name": "nginx", "image": "nginx:1.27", "port": 80 }
-    ]
-  }
-}
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 100m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 8081      # where the Service listens
+    targetPort: 80  # the pods' port
 ```
 
-```json
-{
-  "kind": "Service",
-  "name": "web",
-  "port": 8081,
-  "selector": { "app": "web" }
-}
-```
+| Kind | `apiVersion` | Main fields |
+|---|---|---|
+| `Pod` | `v1` | `spec`: `containers`, `initContainers`, `volumes`, `restartPolicy` |
+| `ReplicaSet`, `Deployment`, `StatefulSet` | `apps/v1` | `spec`: `replicas`, `template` (`metadata.labels` and a pod `spec`; Deployments need labels) |
+| `DaemonSet` | `apps/v1` | `spec`: `template` |
+| `Job` | `batch/v1` | `spec`: `completions` (default 1), `parallelism` (default 1), `backoffLimit` (default 6), `template` |
+| `CronJob` | `batch/v1` | `spec`: `schedule` (cron format, such as `*/5 * * * *`), `suspend`, `jobTemplate.spec` (a Job's spec) |
+| `Service` | `v1` | `spec`: `selector`, `ports` (`port`, and `targetPort`, which defaults to `port`) |
+| `ConfigMap` | `v1` | `data` (keys and values) |
+| `Secret` | `v1` | `data` (values in base64) or `stringData` (plain values) |
+| `Namespace`, `Node` | `v1` | `metadata.name` |
 
-| Kind | Fields |
-|---|---|
-| `Pod` | `name`, `labels`, `containers`, `volumes`, `restartPolicy` |
-| `ReplicaSet` | `name`, `replicas`, `template` (`labels`, `containers`, `volumes`) |
-| `Deployment` | `name`, `replicas`, `template` (`labels` are required) |
-| `StatefulSet` | `name`, `replicas`, `template` |
-| `DaemonSet` | `name`, `template` |
-| `Job` | `name`, `completions` (default 1), `parallelism` (default 1), `backoffLimit` (default 6), `template` |
-| `CronJob` | `name`, `schedule` (cron format, such as `*/5 * * * *`), `suspend`, `jobTemplate` (the Job's fields) |
-| `Service` | `name`, `port`, `selector` |
-| `ConfigMap`, `Secret` | `name`, `data` (keys and values) |
-| `Namespace` | `name` |
-
-Every object except Nodes and Namespaces can also name its `namespace`;
-otherwise `-n` decides, or `default`.
+Every object has a `metadata.name`, and may have `labels`. Objects other
+than Nodes and Namespaces can name their `metadata.namespace`; otherwise `-n`
+decides, or `default`. The API server fills in `uid`, `creationTimestamp`
+and `resourceVersion`.
 
 ### Pods and containers
 
@@ -216,19 +244,24 @@ A container has a `name` and an `image`, and optionally:
 | Field | Meaning |
 |---|---|
 | `command` | the command to run, such as `["sh", "-c", "echo hi"]` |
-| `port` | the port it listens on; the kubelet makes it reachable and reports it as the pod's address |
-| `env` | environment variables: `{"name": "MODE", "value": "fast"}`, or a value from a ConfigMap or Secret: `{"name": "PASSWORD", "valueFrom": {"secretKeyRef": {"name": "db", "key": "password"}}}` |
-| `volumeMounts` | where the pod's volumes appear: `{"name": "config", "mountPath": "/etc/app"}` |
-| `livenessProbe` | a check that restarts the container when it fails: `{"httpGet": {"path": "/healthz"}, "periodSeconds": 10, "failureThreshold": 3}`; without `httpGet` it checks that the port answers |
+| `ports` | the ports it listens on, `- containerPort: 80`; the kubelet makes them reachable and reports where |
+| `env` | environment variables: `{name: MODE, value: fast}`, or a value from a ConfigMap or Secret: `{name: PASSWORD, valueFrom: {secretKeyRef: {name: db, key: password}}}` |
+| `volumeMounts` | where the pod's volumes appear: `{name: config, mountPath: /etc/app}` |
+| `resources` | `requests` and `limits` of `cpu` (`"0.5"` or `500m`) and `memory` (`64Mi`, `1Gi`); a limit without a request is also the request |
+| `livenessProbe` | a check that restarts the container when it fails: `httpGet: {path: /healthz}`, or `exec: {command: [test, -f, /tmp/ok]}`, with `periodSeconds` (default 10) and `failureThreshold` (default 3); with neither, it checks that the port answers |
 | `readinessProbe` | the same kind of check, deciding when the pod gets Service traffic; without one, a container with a port is ready once the port answers |
 
 Every container also gets `POD_NAME`, `POD_NAMESPACE` and `NODE_NAME` in
 its environment.
 
-A pod's `volumes` each have a `name` and one source: `"emptyDir": {}` (an
-empty folder, deleted with the pod), `"hostPath": {"path": "/some/folder"}`,
-`"configMap": {"name": "..."}` or `"secret": {"name": "..."}` (one file per
-key).
+`initContainers` are containers too. They run one at a time, each until it
+exits, before the others start; meanwhile the pod is `Pending` and its status
+says `Init:0/2` and so on. One that fails is run again, or fails the pod if
+its `restartPolicy` is `Never`.
+
+A pod's `volumes` each have a `name` and one source: `emptyDir: {}` (an
+empty folder, deleted with the pod), `hostPath: {path: /some/folder}`,
+`configMap: {name: ...}` or `secret: {secretName: ...}` (one file per key).
 
 `restartPolicy` decides what happens when a container exits: `Always` (the
 default) restarts it, `OnFailure` restarts it only after a failure, and
@@ -251,21 +284,34 @@ the container crashes again, up to 5 minutes. Jobs use `OnFailure` or
 
 The **API server** is the only component that reads and writes the stored
 state. Every other component talks to it over HTTP and never to each other.
-They learn about changes by **watching**: one long-lived HTTP response that
-streams an event for every change to a pod.
+They learn about changes by **watching**: adding `?watch=true` to a list,
+such as `/apis/apps/v1/deployments?watch=true`, turns it into one long-lived
+HTTP response that streams an event for every change.
+
+Components don't ask the API server for everything each time they look.
+Each keeps **informers**: a local copy of one kind of object, filled by a
+list and kept current by a watch. The copy can lag a moment behind, so
+controllers remember the changes they have made but not yet seen
+(**expectations**) and wait for them before acting again; otherwise a
+ReplicaSet controller could count its new pods before they arrive and create
+them twice. The scheduler likewise remembers the pods it has just placed.
 
 Each controller runs a **reconcile loop**: compare how things should be with
-how they are, and fix the difference. It reacts to watch events straight
-away, and also re-checks everything every few seconds, so a missed event is
-never a problem.
+how they are, and fix the difference. It runs whenever its informers change,
+and also every few seconds, for things that depend on time passing.
+
+Every object has a **`resourceVersion`** that changes with every change. An
+update that carries an old `resourceVersion` was made from an outdated copy,
+and is refused with `409 Conflict`, so two writers can't silently undo each
+other's changes.
 
 How a Deployment becomes running containers:
 
 1. `minikubectl apply` sends the Deployment to the API server.
 2. The **Deployment controller** creates a ReplicaSet for the current version of the pod template.
 3. The **ReplicaSet controller** creates the pods.
-4. The **scheduler** sees the new pods and assigns each one to a node.
-5. Each node's **kubelet** sees pods assigned to it, runs their containers, and reports them `Running`, then `Ready` once their port answers.
+4. The **scheduler** sees the new pods and assigns each one to a node. It only considers nodes with enough CPU and memory left for the pod's requests; if none has, the pod stays `Pending` with a `FailedScheduling` event saying why.
+5. Each node's **kubelet** sees pods assigned to it, runs their init containers, then their containers, and reports them `Running`, then `Ready` once their port answers.
 6. The **proxy** sees ready pods that match a Service's selector and starts sending connections to them.
 
 When the template changes, the Deployment controller creates a second
@@ -279,7 +325,7 @@ it is ready, then removes an old one.
 | `apiserver` | [`pkg/apiserver`](pkg/apiserver), [`pkg/store`](pkg/store) | the HTTP API, and storage in memory backed by etcd or a file |
 | `controller-manager` | [`pkg/controller`](pkg/controller), [`pkg/cron`](pkg/cron) | the node, ReplicaSet, Deployment, StatefulSet, DaemonSet, Job and CronJob controllers |
 | `scheduler` | [`pkg/scheduler`](pkg/scheduler) | assigns pods to nodes |
-| `kubelet` | [`pkg/kubelet`](pkg/kubelet), [`pkg/cri`](pkg/cri) | runs pods on one node: restarts containers, runs probes, sets up volumes and environment, serves logs |
+| `kubelet` | [`pkg/kubelet`](pkg/kubelet), [`pkg/cri`](pkg/cri) | runs pods on one node: restarts containers, runs probes, sets up volumes and environment, serves logs and exec |
 | `proxy` | [`pkg/proxy`](pkg/proxy) | forwards connections on Service ports to ready pods |
 | `minikubectl` | [`pkg/client`](pkg/client) | the command-line tool |
 | `minik8s` | | starts all of the above in one terminal |
@@ -324,17 +370,18 @@ MINIK8S_ETCD=localhost:2379 go test ./pkg/store
 
 The overall design follows Kubernetes, but many things are simplified:
 
-- Objects are JSON files rather than YAML, and are simpler than Kubernetes' own.
+- Objects have Kubernetes' shape but fewer fields, and unknown fields are ignored rather than refused.
 - There is one API server. Watches and conflict checks happen in its memory, so several API servers can't share one etcd.
 - There is no authentication or authorization: anyone who can reach the API server can change anything.
 - Pod networking is the host's: each container's port is published on a free port of the machine, and Service ports are shared by all namespaces.
-- `minikubectl logs` asks the kubelet directly instead of going through the API server.
+- `minikubectl logs`, `exec` and `port-forward` talk to the kubelet, or the pod's published port, directly instead of going through the API server; `exec` has no terminal (`-t`).
+- A watch only sends changes from the moment it starts; there is no resuming from a `resourceVersion`.
 - Events are kept in memory only and are lost when the API server restarts.
 - Deleting a namespace or a pod happens at once; there is no `Terminating` state (deleted pods do get a 2-second grace period before their containers are stopped).
 - Secrets are stored as plain text, not encrypted.
 - Volumes need the Docker runtime, and only `emptyDir`, `hostPath`, ConfigMaps and Secrets exist: there are no persistent volumes, so a StatefulSet's pods don't keep their data when they move.
-- Probes check the container's port by HTTP or by connecting; there are no `exec` probes.
-- No resource requests or limits, Ingress, network policies or autoscaling.
+- Resource limits need the Docker runtime; the process runtime ignores them.
+- No Ingress, network policies or autoscaling.
 
 ## License
 

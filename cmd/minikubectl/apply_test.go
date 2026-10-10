@@ -111,3 +111,51 @@ data:
 		t.Error("a ConfigMap with apiVersion apps/v1 was accepted")
 	}
 }
+
+func TestListWithSelectorAndName(t *testing.T) {
+	c, st := newTestCLI(t)
+	for name, app := range map[string]string{"web-1": "web", "web-2": "web", "db-1": "db"} {
+		st.CreatePod(api.Pod{ObjectMeta: api.ObjectMeta{Name: name, Namespace: "default", Labels: api.Labels{"app": app}}})
+	}
+
+	c.selector = "app=web"
+	pods, err := list[api.Pod](c, "pods")
+	if err != nil || len(pods) != 2 {
+		t.Errorf("-l app=web: got %d pods, %v; want 2", len(pods), err)
+	}
+
+	c.selector, c.name = "", "db-1"
+	pods, err = list[api.Pod](c, "pods")
+	if err != nil || len(pods) != 1 || pods[0].Name != "db-1" {
+		t.Errorf("name db-1: got %v, %v", pods, err)
+	}
+
+	c.name = "nope"
+	if _, err := list[api.Pod](c, "pods"); err == nil {
+		t.Error("an unknown name: want an error")
+	}
+
+	// Nodes don't live in a namespace: -n must not get in the way.
+	st.PutNode(api.Node{ObjectMeta: api.ObjectMeta{Name: "node-1"}})
+	c.name = ""
+	if nodes, err := list[api.Node](c, "nodes"); err != nil || len(nodes) != 1 {
+		t.Errorf("nodes: got %v, %v", nodes, err)
+	}
+}
+
+func TestGetCommandArguments(t *testing.T) {
+	c, _ := newTestCLI(t)
+	for _, args := range [][]string{
+		{"pods", "-l"},
+		{"pods", "-l", "=web"},
+		{"pods", "-x"},
+		{"pods", "a", "b"},
+		{"deployments", "-w"},
+		{"pods", "-o", "xml"},
+	} {
+		c.name, c.selector = "", ""
+		if err := c.getCommand(args); err == nil {
+			t.Errorf("get %v: want an error", args)
+		}
+	}
+}

@@ -20,6 +20,7 @@ func TestSplitNamespaceFlags(t *testing.T) {
 		{[]string{"get", "pods", "-n=dev"}, []string{"get", "pods"}, "dev", true, false},
 		{[]string{"get", "pods", "-A"}, []string{"get", "pods"}, "default", false, true},
 		{[]string{"logs", "web-x", "-n", "dev", "-f"}, []string{"logs", "web-x", "-f"}, "dev", true, false},
+		{[]string{"exec", "web-x", "--", "ls", "-n"}, []string{"exec", "web-x", "--", "ls", "-n"}, "default", false, false},
 	}
 
 	for _, tt := range tests {

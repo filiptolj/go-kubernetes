@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/filiptolj/go-kubernetes/pkg/api"
+	"github.com/filiptolj/go-kubernetes/pkg/client"
 )
 
 // get prints a table of one kind of object.
@@ -68,7 +69,7 @@ func (c *cli) row(w io.Writer, namespace string, columns ...any) {
 // getPods prints the pods table. With watch, it then prints a line for every
 // change until you press Ctrl+C.
 func (c *cli) getPods(watch bool) error {
-	pods, err := c.client.ListPods(c.listNamespace())
+	pods, err := list[api.Pod](c, "pods")
 	if err != nil {
 		return err
 	}
@@ -86,14 +87,13 @@ func (c *cli) getPods(watch bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// The API server's watch covers every namespace, so filter here.
-	events, err := c.client.WatchPods(ctx)
+	events, err := client.WatchList[api.Pod](ctx, c.client, "pods", c.listNamespace(), c.selector)
 	if err != nil {
 		return err
 	}
 	for event := range events {
 		pod := event.Object
-		if !c.all && pod.Namespace != c.namespace {
+		if c.name != "" && pod.Name != c.name {
 			continue
 		}
 		name := pod.Name
@@ -112,7 +112,7 @@ func (c *cli) getPods(watch bool) error {
 // getNodes prints the nodes table. Nodes belong to the whole cluster, not to
 // a namespace.
 func (c *cli) getNodes() error {
-	nodes, err := c.client.ListNodes()
+	nodes, err := list[api.Node](c, "nodes")
 	if err != nil {
 		return err
 	}
@@ -136,7 +136,7 @@ func (c *cli) getNodes() error {
 
 // getNamespaces prints the namespaces table.
 func (c *cli) getNamespaces() error {
-	namespaces, err := c.client.ListNamespaces()
+	namespaces, err := list[api.Namespace](c, "namespaces")
 	if err != nil {
 		return err
 	}
@@ -152,7 +152,7 @@ func (c *cli) getNamespaces() error {
 // getReplicaSets prints the ReplicaSets table: how many pods each one wants,
 // how many it has, and how many of those are running.
 func (c *cli) getReplicaSets() error {
-	sets, err := c.client.ListReplicaSets(c.listNamespace())
+	sets, err := list[api.ReplicaSet](c, "replicasets")
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (c *cli) getReplicaSets() error {
 // how many ready ones run the current version of its template, and how many
 // are ready in total.
 func (c *cli) getDeployments() error {
-	deployments, err := c.client.ListDeployments(c.listNamespace())
+	deployments, err := list[api.Deployment](c, "deployments")
 	if err != nil {
 		return err
 	}
@@ -269,7 +269,7 @@ func sameTemplate(a, b api.PodTemplateSpec) bool {
 // getServices prints the Services table, with how many ready pods each one
 // currently forwards to.
 func (c *cli) getServices() error {
-	services, err := c.client.ListServices(c.listNamespace())
+	services, err := list[api.Service](c, "services")
 	if err != nil {
 		return err
 	}

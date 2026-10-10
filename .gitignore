@@ -1,6 +1,15 @@
 # Programs built with `go build -o bin/ ./cmd/...`
 bin/
 
+# Programs built with a plain `go build ./cmd/<name>`, which puts them here
+/apiserver
+/controller-manager
+/kubelet
+/minik8s
+/minikubectl
+/proxy
+/scheduler
+
 # The cluster state the API server saves by default
 data/
 

@@ -15,13 +15,15 @@ import (
 const usage = `usage: minikubectl [-server URL] <command> [-n namespace | -A]
 
 commands:
-  get <resource> [-w for pods]
+  get <resource> [name] [-l selector] [-o yaml|json|name] [-w for pods]
   apply -f <file or folder>          YAML or JSON, several objects per file
   create namespace <name>
   delete <resource> <name>
   scale replicaset|deployment|statefulset <name> <replicas>
   describe <resource> <name>
   logs <pod> [-c container] [-f]
+  exec <pod> [-c container] [-i] -- <command> [args...]
+  port-forward <pod> [local-port:]<pod-port>
   version
 
 resources: pods, nodes, replicasets, deployments, statefulsets, daemonsets,
@@ -40,10 +42,22 @@ func main() {
 		c := &cli{client: client.New(*server), namespace: namespace, namespaceGiven: given, all: all}
 		err = c.run(args)
 	}
+	var code exitCode
+	if errors.As(err, &code) {
+		os.Exit(int(code)) // exec: pass on the command's exit code, quietly
+	}
 	if err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)
 	}
+}
+
+// exitCode is returned by a command that wants minikubectl to exit with this
+// code, without printing an error: exec, when the command in the container fails.
+type exitCode int
+
+func (e exitCode) Error() string {
+	return fmt.Sprintf("exit code %d", int(e))
 }
 
 // cli holds what every command needs: the API client, and the namespace to
@@ -53,6 +67,11 @@ type cli struct {
 	namespace      string // from -n, or "default"
 	namespaceGiven bool   // whether -n was given
 	all            bool   // -A: every namespace
+
+	// For get: only objects with this name ("" for all), and matching this
+	// label selector ("" for all).
+	name     string
+	selector string
 }
 
 // listNamespace returns the namespace to list objects in: "" means all of them.
@@ -73,6 +92,10 @@ func splitNamespaceFlags(args []string) (rest []string, namespace string, given,
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
+		case arg == "--":
+			// Everything after -- belongs to someone else, such as the
+			// command of exec, even if it looks like -n.
+			return append(rest, args[i:]...), namespace, given, all, nil
 		case arg == "-A" || arg == "--all-namespaces":
 			all = true
 		case arg == "-n" || arg == "--namespace":
@@ -103,10 +126,7 @@ func (c *cli) run(args []string) error {
 		return nil
 
 	case "get":
-		if len(args) < 2 {
-			return errors.New("you must specify a resource, e.g. 'get pods'")
-		}
-		return c.get(args[1], len(args) >= 3 && args[2] == "-w")
+		return c.getCommand(args[1:])
 
 	case "apply":
 		if len(args) < 3 || args[1] != "-f" {
@@ -144,6 +164,12 @@ func (c *cli) run(args []string) error {
 
 	case "logs":
 		return c.logs(args[1:])
+
+	case "exec":
+		return c.exec(args[1:])
+
+	case "port-forward":
+		return c.portForward(args[1:])
 
 	default:
 		return fmt.Errorf("unknown command %q\n%s", args[0], usage)

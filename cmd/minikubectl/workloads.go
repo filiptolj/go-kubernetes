@@ -113,15 +113,15 @@ func (c *cli) getWorkload(resource string) (bool, error) {
 	case isStatefulSet(resource):
 		return true, c.getStatefulSets()
 	case isConfigMap(resource):
-		return true, getData(c, c.client.ConfigMaps().List, func(cm api.ConfigMap) (api.ObjectMeta, int) { return cm.ObjectMeta, len(cm.Data) })
+		return true, getData(c, list[api.ConfigMap], "configmaps", func(cm api.ConfigMap) (api.ObjectMeta, int) { return cm.ObjectMeta, len(cm.Data) })
 	case isSecret(resource):
-		return true, getData(c, c.client.Secrets().List, func(s api.Secret) (api.ObjectMeta, int) { return s.ObjectMeta, len(s.Data) })
+		return true, getData(c, list[api.Secret], "secrets", func(s api.Secret) (api.ObjectMeta, int) { return s.ObjectMeta, len(s.Data) })
 	}
 	return false, nil
 }
 
 func (c *cli) getJobs() error {
-	jobs, err := c.client.Jobs().List(c.listNamespace())
+	jobs, err := list[api.Job](c, "jobs")
 	if err != nil {
 		return err
 	}
@@ -143,7 +143,7 @@ func (c *cli) getJobs() error {
 }
 
 func (c *cli) getCronJobs() error {
-	cronJobs, err := c.client.CronJobs().List(c.listNamespace())
+	cronJobs, err := list[api.CronJob](c, "cronjobs")
 	if err != nil {
 		return err
 	}
@@ -160,7 +160,7 @@ func (c *cli) getCronJobs() error {
 }
 
 func (c *cli) getDaemonSets() error {
-	sets, err := c.client.DaemonSets().List(c.listNamespace())
+	sets, err := list[api.DaemonSet](c, "daemonsets")
 	if err != nil {
 		return err
 	}
@@ -189,7 +189,7 @@ func (c *cli) getDaemonSets() error {
 }
 
 func (c *cli) getStatefulSets() error {
-	sets, err := c.client.StatefulSets().List(c.listNamespace())
+	sets, err := list[api.StatefulSet](c, "statefulsets")
 	if err != nil {
 		return err
 	}
@@ -209,8 +209,8 @@ func (c *cli) getStatefulSets() error {
 // getData prints the table for ConfigMaps or Secrets: their names and how
 // many keys they hold. list and describe are passed in, so one function
 // serves both kinds.
-func getData[T any](c *cli, list func(string) ([]T, error), describe func(T) (api.ObjectMeta, int)) error {
-	objects, err := list(c.listNamespace())
+func getData[T any](c *cli, list func(*cli, string) ([]T, error), plural string, describe func(T) (api.ObjectMeta, int)) error {
+	objects, err := list(c, plural)
 	if err != nil {
 		return err
 	}

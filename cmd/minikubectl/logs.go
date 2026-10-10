@@ -33,34 +33,14 @@ func (c *cli) logs(args []string) error {
 		return err
 	}
 
-	pod, err := c.client.GetPod(c.namespace, podName)
-	if err != nil {
-		return err
-	}
-
-	if *container == "" {
-		if len(pod.Containers) != 1 {
-			return fmt.Errorf("pod %q has %d containers: choose one with -c", podName, len(pod.Containers))
-		}
-		*container = pod.Containers[0].Name
-	}
-
-	if pod.NodeName == "" {
-		return fmt.Errorf("pod %q isn't scheduled on a node yet, so it has no logs", podName)
-	}
-
 	// Logs live on the node that ran the pod, so ask that node's kubelet.
-	nodes, err := c.client.ListNodes()
+	pod, name, kubelet, err := c.findContainer(podName, *container)
 	if err != nil {
 		return err
 	}
-	i := slices.IndexFunc(nodes, func(n api.Node) bool { return n.Name == pod.NodeName })
-	if i < 0 || nodes[i].Address == "" {
-		return fmt.Errorf("node %q has no kubelet address to ask for logs", pod.NodeName)
-	}
 
-	logsURL := nodes[i].Address + "/logs/" + url.PathEscape(pod.Namespace) + "/" +
-		url.PathEscape(podName) + "/" + url.PathEscape(*container)
+	logsURL := kubelet + "/logs/" + url.PathEscape(pod.Namespace) + "/" +
+		url.PathEscape(podName) + "/" + url.PathEscape(name)
 	if *follow {
 		logsURL += "?follow=true"
 	}
@@ -88,4 +68,34 @@ func (c *cli) logs(args []string) error {
 		return err
 	}
 	return nil
+}
+
+// findContainer looks up a pod in the current namespace, and the address of
+// the kubelet that runs it. It also picks the container: the one named, or
+// else the pod's only container.
+func (c *cli) findContainer(podName, container string) (pod api.Pod, name, kubelet string, err error) {
+	pod, err = c.client.GetPod(c.namespace, podName)
+	if err != nil {
+		return pod, "", "", err
+	}
+
+	if container == "" {
+		if len(pod.Containers) != 1 {
+			return pod, "", "", fmt.Errorf("pod %q has %d containers: choose one with -c", podName, len(pod.Containers))
+		}
+		container = pod.Containers[0].Name
+	}
+
+	if pod.NodeName == "" {
+		return pod, "", "", fmt.Errorf("pod %q isn't scheduled on a node yet", podName)
+	}
+	nodes, err := c.client.ListNodes()
+	if err != nil {
+		return pod, "", "", err
+	}
+	i := slices.IndexFunc(nodes, func(n api.Node) bool { return n.Name == pod.NodeName })
+	if i < 0 || nodes[i].Address == "" {
+		return pod, "", "", fmt.Errorf("node %q has no kubelet address", pod.NodeName)
+	}
+	return pod, container, nodes[i].Address, nil
 }
